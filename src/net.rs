@@ -9,6 +9,8 @@
 //! de cette étape est seulement d'avoir un `Evaluator` qui marche. L'entraînement
 //! TD(λ) viendra ensuite.
 
+use std::path::Path;
+
 use crate::board::Board;
 use crate::dice::Dice;
 use crate::encoding::{encode, N_INPUTS};
@@ -166,6 +168,53 @@ impl Net {
         }
         self.b2 += factor * trace.b2;
     }
+
+    /// Sauvegarde les poids dans un fichier texte (un nombre par ligne, précédé
+    /// de la taille de la couche cachée). Le format `f64` de Rust est réécrit
+    /// sans perte, donc le rechargement est exact.
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(s, "{}", self.hidden);
+        for v in self
+            .w1
+            .iter()
+            .chain(self.b1.iter())
+            .chain(self.w2.iter())
+            .chain(std::iter::once(&self.b2))
+        {
+            let _ = writeln!(s, "{v}");
+        }
+        std::fs::write(path, s)
+    }
+
+    /// Recharge un réseau sauvegardé par [`Net::save`].
+    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Net> {
+        use std::io::{Error, ErrorKind};
+        let text = std::fs::read_to_string(path)?;
+        let mut it = text.split_whitespace();
+        let hidden: usize = it
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "taille cachée manquante"))?;
+        let nums: Vec<f64> = it.filter_map(|s| s.parse().ok()).collect();
+
+        let n_w1 = hidden * N_INPUTS;
+        let expected = n_w1 + hidden + hidden + 1;
+        if nums.len() != expected {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("{} poids lus, {expected} attendus", nums.len()),
+            ));
+        }
+        Ok(Net {
+            hidden,
+            w1: nums[..n_w1].to_vec(),
+            b1: nums[n_w1..n_w1 + hidden].to_vec(),
+            w2: nums[n_w1 + hidden..n_w1 + 2 * hidden].to_vec(),
+            b2: nums[n_w1 + 2 * hidden],
+        })
+    }
 }
 
 impl Evaluator for Net {
@@ -242,6 +291,21 @@ mod tests {
         let yb = net.forward(&xb).1;
         assert!((ya - 0.8).abs() < 0.05, "ya={ya}");
         assert!((yb - 0.2).abs() < 0.05, "yb={yb}");
+    }
+
+    #[test]
+    fn sauvegarde_et_rechargement_exacts() {
+        let net = Net::new_random(20, 99);
+        let path = std::env::temp_dir().join("backgammon_test_net.txt");
+        net.save(&path).unwrap();
+        let loaded = Net::load(&path).unwrap();
+
+        // Les valeurs doivent être identiques sur plusieurs positions.
+        let b1 = Board::starting_position();
+        let b2 = b1.swap_perspective();
+        assert_eq!(net.value(&b1), loaded.value(&b1));
+        assert_eq!(net.value(&b2), loaded.value(&b2));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

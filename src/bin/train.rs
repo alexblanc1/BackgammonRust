@@ -49,4 +49,10 @@ fn main() {
     }
 
     println!("\nTerminé en {:.1?}.", start.elapsed());
+
+    let path = "net.txt";
+    match net.save(path) {
+        Ok(()) => println!("Poids sauvegardés dans « {path} ». La TUI le chargera automatiquement."),
+        Err(e) => eprintln!("Échec de la sauvegarde dans « {path} » : {e}"),
+    }
 }

@@ -20,6 +20,7 @@ use backgammon::agent::heuristic::evaluate;
 use backgammon::board::Board;
 use backgammon::dice::{Dice, Roll};
 use backgammon::moves::legal_plays;
+use backgammon::net::Net;
 use backgammon::player::Player;
 
 /// Hauteur d'affichage d'une pile de pions.
@@ -36,13 +37,20 @@ fn dim() -> Style {
 
 /// Prépare le terminal, joue la partie, puis restaure le terminal.
 pub fn run() -> io::Result<()> {
+    // Si un réseau entraîné a été sauvegardé (`cargo run --release --bin train`),
+    // on joue contre lui ; sinon, contre l'heuristique.
+    let ai = match Net::load("net.txt") {
+        Ok(net) => Ai::Net(net),
+        Err(_) => Ai::Heuristic,
+    };
+
     let mut terminal = ratatui::init();
-    let result = run_game(&mut terminal);
+    let result = run_game(&mut terminal, &ai);
     ratatui::restore();
     result
 }
 
-fn run_game(terminal: &mut DefaultTerminal) -> io::Result<()> {
+fn run_game(terminal: &mut DefaultTerminal, ai: &Ai) -> io::Result<()> {
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -62,23 +70,23 @@ fn run_game(terminal: &mut DefaultTerminal) -> io::Result<()> {
                 Line::from(format!("{} ne peut pas jouer ce lancer.", who(to_move))),
                 Line::from("Tour passé."),
             ];
-            if !wait_or_quit(terminal, &view, info_lines(to_move, roll), "Pas de coup", msg)? {
+            if !wait_or_quit(terminal, &view, info_lines(to_move, roll, ai.label()), "Pas de coup", msg)? {
                 return Ok(());
             }
         } else if to_move == Player::White {
-            match human_select(terminal, &board, &plays, roll)? {
+            match human_select(terminal, &board, &plays, roll, ai.label())? {
                 Some(i) => board = plays[i].clone(),
                 None => return Ok(()), // l'utilisateur a quitté
             }
         } else {
-            let i = ai_choose(&plays);
+            let i = ai.choose(&plays);
             board = plays[i].clone();
             let view_after = white_view(&board, to_move);
             let msg = vec![
                 Line::from("L'IA a joué son tour."),
                 Line::from("Observe le plateau."),
             ];
-            if !wait_or_quit(terminal, &view_after, info_lines(to_move, roll), "IA", msg)? {
+            if !wait_or_quit(terminal, &view_after, info_lines(to_move, roll, ai.label()), "IA", msg)? {
                 return Ok(());
             }
         }
@@ -92,7 +100,7 @@ fn run_game(terminal: &mut DefaultTerminal) -> io::Result<()> {
             wait_or_quit(
                 terminal,
                 &view_final,
-                info_lines(to_move, roll),
+                info_lines(to_move, roll, ai.label()),
                 "Fin de la partie",
                 vec![Line::from(label), Line::from("Une touche pour quitter.")],
             )?;
@@ -113,6 +121,7 @@ fn human_select(
     board: &Board,
     plays: &[Board],
     roll: Roll,
+    opp: &str,
 ) -> io::Result<Option<usize>> {
     let mut sel = 0usize;
     loop {
@@ -135,7 +144,7 @@ fn human_select(
         draw(
             terminal,
             board,
-            info_lines(Player::White, roll),
+            info_lines(Player::White, roll, opp),
             "Coups possibles",
             panel,
             "↑/↓ choisir   Entrée valider   q quitter",
@@ -179,18 +188,36 @@ fn wait_or_quit(
     }
 }
 
-/// Choix de l'IA : l'argmax de l'évaluation heuristique sur les coups possibles.
-fn ai_choose(plays: &[Board]) -> usize {
-    let mut best = 0usize;
-    let mut best_score = f64::NEG_INFINITY;
-    for (i, b) in plays.iter().enumerate() {
-        let s = evaluate(b);
-        if s > best_score {
-            best_score = s;
-            best = i;
+/// L'adversaire : l'heuristique, ou un réseau entraîné chargé depuis un fichier.
+enum Ai {
+    Heuristic,
+    Net(Net),
+}
+
+impl Ai {
+    /// Indice du coup que l'IA préfère (argmax de sa valeur).
+    fn choose(&self, plays: &[Board]) -> usize {
+        let mut best = 0usize;
+        let mut best_score = f64::NEG_INFINITY;
+        for (i, b) in plays.iter().enumerate() {
+            let s = match self {
+                Ai::Heuristic => evaluate(b),
+                Ai::Net(net) => net.value(b),
+            };
+            if s > best_score {
+                best_score = s;
+                best = i;
+            }
+        }
+        best
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Ai::Heuristic => "heuristique",
+            Ai::Net(_) => "réseau entraîné",
         }
     }
-    best
 }
 
 // --- Rendu -------------------------------------------------------------------
@@ -217,7 +244,7 @@ fn render(
     );
 
     let [info_area, panel_area] =
-        Layout::vertical([Constraint::Length(4), Constraint::Min(3)]).areas(side);
+        Layout::vertical([Constraint::Length(5), Constraint::Min(3)]).areas(side);
     f.render_widget(
         Paragraph::new(info).block(Block::bordered().title(" Infos ")),
         info_area,
@@ -243,10 +270,11 @@ fn draw(
     Ok(())
 }
 
-fn info_lines(to_move: Player, roll: Roll) -> Vec<Line<'static>> {
+fn info_lines(to_move: Player, roll: Roll, opp: &str) -> Vec<Line<'static>> {
     vec![
         Line::from(format!("Tour : {}", who(to_move))),
         Line::from(format!("Dés  : {} - {}", roll.d1, roll.d2)),
+        Line::from(format!("IA   : {opp}")),
     ]
 }
 
@@ -416,7 +444,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, &board, info_lines(Player::White, roll), "Coups", panel, "aide"))
+            .draw(|f| render(f, &board, info_lines(Player::White, roll, "heuristique"), "Coups", panel, "aide"))
             .unwrap();
 
         let screen = format!("{}", terminal.backend());
