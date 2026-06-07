@@ -3,8 +3,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use backgammon::agent::Agent;
+use backgammon::agent::heuristic::HeuristicAgent;
 use backgammon::agent::human::HumanAgent;
-use backgammon::agent::random::RandomAgent;
 use backgammon::dice::Dice;
 use backgammon::game::play;
 
@@ -17,10 +17,10 @@ fn main() {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x1234_5678);
 
-    // agents[0] = Blancs (toi), agents[1] = Noirs (l'ordinateur).
+    // agents[0] = Blancs (toi), agents[1] = Noirs (l'IA heuristique).
     let mut agents: [Box<dyn Agent>; 2] = [
         Box::new(HumanAgent::new()),
-        Box::new(RandomAgent::new(seed ^ 0xDEAD_BEEF)),
+        Box::new(HeuristicAgent::new()),
     ];
     let mut dice = Dice::new(seed | 1);
 
