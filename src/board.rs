@@ -161,6 +161,24 @@ impl Board {
         }
         Some(2) // gammon
     }
+
+    // --- Accès en lecture seule (pour l'affichage hors du moteur) ------------
+
+    /// Les 24 cases, du point de vue du joueur à jouer (`> 0` = à lui, `< 0` =
+    /// adverse).
+    pub fn points(&self) -> &[i8; 24] {
+        &self.points
+    }
+
+    /// Pions sur la barre : `[à jouer, adverse]`.
+    pub fn bar(&self) -> [u8; 2] {
+        self.bar
+    }
+
+    /// Pions sortis : `[à jouer, adverse]`.
+    pub fn off(&self) -> [u8; 2] {
+        self.off
+    }
 }
 
 
