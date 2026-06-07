@@ -11,6 +11,7 @@
 pub mod agent;
 pub mod board;
 pub mod dice;
+pub mod encoding;
 pub mod eval;
 pub mod game;
 pub mod moves;
@@ -21,6 +22,7 @@ pub mod player;
 pub use agent::Agent;
 pub use board::Board;
 pub use dice::{Dice, Roll};
+pub use encoding::{encode, N_INPUTS};
 pub use eval::{Evaluator, GreedyAgent};
 pub use game::{GameState, Phase};
 pub use player::Player;
