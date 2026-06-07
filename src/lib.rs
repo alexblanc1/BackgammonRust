@@ -17,6 +17,7 @@ pub mod game;
 pub mod moves;
 pub mod net;
 pub mod player;
+pub mod train;
 
 // Ré-exports : permet d'écrire `backgammon::Board` plutôt que
 // `backgammon::board::Board`.

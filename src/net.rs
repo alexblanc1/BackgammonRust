@@ -143,6 +143,29 @@ impl Net {
         self.b2 += step * g.b2;
         err
     }
+
+    /// Un gradient/trace de la bonne forme, initialisé à zéro.
+    pub fn zero_gradients(&self) -> Gradients {
+        Gradients {
+            w1: vec![0.0; self.w1.len()],
+            b1: vec![0.0; self.hidden],
+            w2: vec![0.0; self.hidden],
+            b2: 0.0,
+        }
+    }
+
+    /// Applique `Δw = facteur · trace` à tous les poids. Brique de la mise à
+    /// jour TD(λ) : `facteur = α · erreur_TD`, `trace` = trace d'éligibilité.
+    pub fn apply_update(&mut self, trace: &Gradients, factor: f64) {
+        for k in 0..self.w1.len() {
+            self.w1[k] += factor * trace.w1[k];
+        }
+        for j in 0..self.hidden {
+            self.b1[j] += factor * trace.b1[j];
+            self.w2[j] += factor * trace.w2[j];
+        }
+        self.b2 += factor * trace.b2;
+    }
 }
 
 impl Evaluator for Net {
