@@ -4,33 +4,28 @@
 //! de critères. Elle sert d'adversaire correct et de point de comparaison pour
 //! les versions futures (le réseau de neurones devra la battre).
 
-use crate::agent::Agent;
 use crate::board::Board;
-use crate::game::GameState;
+use crate::eval::{Evaluator, GreedyAgent};
 
-/// Joue, parmi les positions légales, celle qui maximise `evaluate`.
-pub struct HeuristicAgent;
+/// L'évaluateur heuristique. Sans état : il délègue à la fonction `evaluate`.
+pub struct HeuristicEvaluator;
 
-impl HeuristicAgent {
-    pub fn new() -> HeuristicAgent {
-        HeuristicAgent
+impl HeuristicEvaluator {
+    pub fn new() -> HeuristicEvaluator {
+        HeuristicEvaluator
     }
 }
 
-impl Agent for HeuristicAgent {
-    fn choose_play(&mut self, _state: &GameState, legal: &[Board]) -> usize {
-        // argmax : on garde l'indice du candidat au meilleur score.
-        let mut best = 0usize;
-        let mut best_score = f64::NEG_INFINITY;
-        for (i, candidate) in legal.iter().enumerate() {
-            let score = evaluate(candidate);
-            if score > best_score {
-                best_score = score;
-                best = i;
-            }
-        }
-        best
+impl Evaluator for HeuristicEvaluator {
+    fn evaluate(&self, board: &Board) -> f64 {
+        evaluate(board)
     }
+}
+
+/// Agent heuristique prêt à l'emploi : un `GreedyAgent` qui joue l'argmax de
+/// `HeuristicEvaluator`.
+pub fn heuristic_agent() -> GreedyAgent<HeuristicEvaluator> {
+    GreedyAgent::new(HeuristicEvaluator::new())
 }
 
 // --- L'évaluateur ------------------------------------------------------------
@@ -118,6 +113,7 @@ fn made_points(b: &Board) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Agent;
     use crate::agent::random::RandomAgent;
     use crate::dice::Dice;
     use crate::game::play;
@@ -160,13 +156,13 @@ mod tests {
             let heuristic_is_white = seed % 2 == 0;
             let mut agents: [Box<dyn Agent>; 2] = if heuristic_is_white {
                 [
-                    Box::new(HeuristicAgent::new()),
+                    Box::new(heuristic_agent()),
                     Box::new(RandomAgent::new(seed * 7 + 1)),
                 ]
             } else {
                 [
                     Box::new(RandomAgent::new(seed * 7 + 1)),
-                    Box::new(HeuristicAgent::new()),
+                    Box::new(heuristic_agent()),
                 ]
             };
             let mut dice = Dice::new(seed.wrapping_mul(2_654_435_761).wrapping_add(12_345));

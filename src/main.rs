@@ -3,7 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use backgammon::agent::Agent;
-use backgammon::agent::heuristic::HeuristicAgent;
+use backgammon::agent::heuristic::heuristic_agent;
 use backgammon::agent::human::HumanAgent;
 use backgammon::dice::Dice;
 use backgammon::game::play;
@@ -20,7 +20,7 @@ fn main() {
     // agents[0] = Blancs (toi), agents[1] = Noirs (l'IA heuristique).
     let mut agents: [Box<dyn Agent>; 2] = [
         Box::new(HumanAgent::new()),
-        Box::new(HeuristicAgent::new()),
+        Box::new(heuristic_agent()),
     ];
     let mut dice = Dice::new(seed | 1);
 
