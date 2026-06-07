@@ -35,6 +35,16 @@ pub struct Net {
     b2: f64,
 }
 
+/// Gradient de la sortie du réseau par rapport à chaque poids (même forme que
+/// les poids du réseau). Sert à l'entraînement : descente de gradient ici, et
+/// plus tard les traces d'éligibilité de TD(λ).
+pub struct Gradients {
+    pub w1: Vec<f64>,
+    pub b1: Vec<f64>,
+    pub w2: Vec<f64>,
+    pub b2: f64,
+}
+
 impl Net {
     /// Crée un réseau aux poids aléatoires (petits) et biais nuls.
     pub fn new_random(hidden: usize, seed: u64) -> Net {
@@ -79,6 +89,60 @@ impl Net {
         let x = encode(board);
         self.forward(&x).1
     }
+
+    /// Rétropropagation : gradient de la sortie `y` par rapport à tous les
+    /// poids, à partir de l'entrée `x` et des activations cachées `h` et de la
+    /// sortie `y` déjà calculées par `forward`.
+    pub fn output_gradient(&self, x: &[f64; N_INPUTS], h: &[f64], y: f64) -> Gradients {
+        // Dérivée de la sigmoïde à la sortie : sigmoid'(z2) = y·(1 − y).
+        let dy_dz2 = y * (1.0 - y);
+
+        let mut g_w1 = vec![0.0; self.w1.len()];
+        let mut g_b1 = vec![0.0; self.hidden];
+        let mut g_w2 = vec![0.0; self.hidden];
+
+        for j in 0..self.hidden {
+            // Couche de sortie.
+            g_w2[j] = dy_dz2 * h[j]; // ∂y/∂w2[j]
+
+            // Rétropropagation vers la couche cachée.
+            let dy_dh = dy_dz2 * self.w2[j]; // ∂y/∂h[j]
+            let dy_dz1 = dy_dh * h[j] * (1.0 - h[j]); // × sigmoid'(z1[j])
+            g_b1[j] = dy_dz1; // ∂y/∂b1[j]
+
+            let base = j * N_INPUTS;
+            for i in 0..N_INPUTS {
+                g_w1[base + i] = dy_dz1 * x[i]; // ∂y/∂w1[j][i]
+            }
+        }
+
+        Gradients {
+            w1: g_w1,
+            b1: g_b1,
+            w2: g_w2,
+            b2: dy_dz2, // ∂y/∂b2
+        }
+    }
+
+    /// Un pas de descente de gradient pour rapprocher la sortie de `target`
+    /// (erreur quadratique). Met à jour les poids et renvoie l'erreur `target − y`
+    /// observée *avant* le pas.
+    pub fn train_step(&mut self, x: &[f64; N_INPUTS], target: f64, lr: f64) -> f64 {
+        let (h, y) = self.forward(x);
+        let g = self.output_gradient(x, &h, y);
+        let err = target - y;
+        let step = lr * err; // Δw = lr · (target − y) · ∂y/∂w
+
+        for k in 0..self.w1.len() {
+            self.w1[k] += step * g.w1[k];
+        }
+        for j in 0..self.hidden {
+            self.b1[j] += step * g.b1[j];
+            self.w2[j] += step * g.w2[j];
+        }
+        self.b2 += step * g.b2;
+        err
+    }
 }
 
 impl Evaluator for Net {
@@ -116,6 +180,45 @@ mod tests {
         let v2 = net.value(&Board::starting_position());
         assert!(v1 > 0.0 && v1 < 1.0, "valeur hors (0,1) : {v1}");
         assert_eq!(v1, v2, "le réseau doit être déterministe");
+    }
+
+    #[test]
+    fn apprend_une_cible_fixe() {
+        // Surapprentissage : sur une seule entrée, la sortie doit converger
+        // vers la cible. Si la backprop est fausse, ça ne converge pas.
+        let mut net = Net::new_random(10, 5);
+        let x = encode(&Board::starting_position());
+        for _ in 0..2000 {
+            net.train_step(&x, 0.9, 0.1);
+        }
+        let y = net.forward(&x).1;
+        assert!((y - 0.9).abs() < 0.01, "y={y} n'a pas convergé vers 0.9");
+    }
+
+    #[test]
+    fn apprend_a_distinguer_deux_positions() {
+        // Deux entrées distinctes vers deux cibles distinctes : seul un gradient
+        // correct à travers la couche cachée permet de les séparer.
+        let mut net = Net::new_random(20, 3);
+        let xa = encode(&Board::starting_position());
+        let xb = encode(&Board {
+            points: {
+                let mut p = [0i8; 24];
+                p[0] = 2;
+                p[23] = -2;
+                p
+            },
+            bar: [0, 0],
+            off: [0, 0],
+        });
+        for _ in 0..5000 {
+            net.train_step(&xa, 0.8, 0.1);
+            net.train_step(&xb, 0.2, 0.1);
+        }
+        let ya = net.forward(&xa).1;
+        let yb = net.forward(&xb).1;
+        assert!((ya - 0.8).abs() < 0.05, "ya={ya}");
+        assert!((yb - 0.2).abs() < 0.05, "yb={yb}");
     }
 
     #[test]
