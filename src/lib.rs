@@ -15,6 +15,7 @@ pub mod encoding;
 pub mod eval;
 pub mod game;
 pub mod moves;
+pub mod net;
 pub mod player;
 
 // Ré-exports : permet d'écrire `backgammon::Board` plutôt que
@@ -24,5 +25,6 @@ pub use board::Board;
 pub use dice::{Dice, Roll};
 pub use encoding::{encode, N_INPUTS};
 pub use eval::{Evaluator, GreedyAgent};
+pub use net::Net;
 pub use game::{GameState, Phase};
 pub use player::Player;

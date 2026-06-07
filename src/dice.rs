@@ -48,6 +48,12 @@ impl Dice {
         (self.next_u64() % bound as u64) as usize
     }
 
+    /// Un flottant pseudo-aléatoire uniforme dans `[0, 1)`.
+    /// (On garde les 53 bits de poids fort pour remplir la mantisse d'un `f64`.)
+    pub fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
     /// Lance les deux dés.
     pub fn roll(&mut self) -> Roll {
         Roll {
