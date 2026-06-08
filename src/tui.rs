@@ -4,9 +4,15 @@
 //! dépendance d'affichage. Le plateau est toujours montré du point de vue des
 //! Blancs (le joueur humain) ; on retourne la position pour l'affichage quand
 //! c'est l'IA qui vient de jouer.
+//!
+//! Orientation : ta base (jan intérieur) est en **bas à droite**, l'adversaire
+//! démarre en **haut à droite**, comme sur un vrai plateau.
+//!
+//! Saisie d'un coup : tu déplaces un curseur sur le plateau avec `hjkl`, les
+//! coups possibles s'affichent en surbrillance, et tu joues pion par pion.
 
 use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
@@ -23,12 +29,17 @@ use backgammon::moves::legal_plays;
 use backgammon::net::Net;
 use backgammon::player::Player;
 
-/// Hauteur d'affichage d'une pile de pions.
-const H: usize = 5;
+/// Hauteur d'affichage d'une pile de pions (plus grand = plus lisible).
+const H: usize = 6;
 
 const HUMAN: Color = Color::Cyan; // tes pions (●)
 const AI: Color = Color::Red; // pions de l'IA (●)
-const DIM: Color = Color::DarkGray;
+/// Gris « discret » mais en RGB explicite : contrairement à `DarkGray` (un
+/// index de la palette du terminal, parfois confondu avec le fond selon le
+/// thème), un RGB fixe reste visible quel que soit le thème.
+const DIM: Color = Color::Rgb(125, 125, 125);
+/// Couleur des numéros de cases (les « bandes ») : RGB fixe, toujours visible.
+const LABEL: Color = Color::Rgb(165, 165, 165);
 /// Teintes des bandes (triangles) du plateau : une claire, une foncée.
 const BAND_LIGHT: Color = Color::Rgb(222, 209, 184);
 const BAND_DARK: Color = Color::Rgb(96, 70, 50);
@@ -36,6 +47,19 @@ const BAND_DARK: Color = Color::Rgb(96, 70, 50);
 const BAR_COLOR: Color = Color::Rgb(150, 111, 71);
 /// Couleur d'accent pour les titres des cadres.
 const ACCENT: Color = Color::Rgb(216, 190, 120);
+
+// Couleurs de surbrillance lors de la saisie d'un coup.
+const SRC_BG: Color = Color::Rgb(45, 60, 82); // cases d'où tu peux jouer
+const DST_BG: Color = Color::Rgb(34, 96, 52); // destinations possibles
+const PICK_BG: Color = Color::Rgb(122, 96, 26); // case « prise en main »
+const CURSOR_BG: Color = Color::Rgb(70, 70, 82); // position du curseur
+
+/// Disposition visuelle des 12 cases du haut (de gauche à droite) : indices
+/// moteur 12..17 à gauche de la barre, 18..23 à droite.
+const TOP_IDX: [usize; 12] = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23];
+/// Disposition visuelle des 12 cases du bas : 11..6 à gauche, puis 5..0 à
+/// droite. Ainsi l'index 0 (ta « case 1 », d'où tu sors) est en bas à droite.
+const BOT_IDX: [usize; 12] = [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
 
 fn dim() -> Style {
     Style::default().fg(DIM)
@@ -75,39 +99,54 @@ fn run_game(terminal: &mut DefaultTerminal, ai: &Ai) -> io::Result<()> {
     loop {
         let roll = dice.roll();
         let plays = legal_plays(&board, &roll);
-        let view = white_view(&board, to_move);
 
         if plays.is_empty() {
-            let msg = vec![
-                Line::from(format!("{} ne peut pas jouer ce lancer.", who(to_move))),
-                Line::from("Tour passé."),
-            ];
-            if !wait(terminal, &view, to_move, roll, ai.label(), "Pas de coup", msg)? {
+            // Personne ne peut jouer ce lancer : on l'annonce, puis on enchaîne.
+            let view = white_view(&board, to_move);
+            let screen = Screen {
+                view: &view,
+                to_move,
+                roll,
+                opp: ai.label(),
+                title: "Pas de coup",
+                panel: vec![
+                    Line::from(format!("{} ne peut pas jouer ce lancer.", who(to_move))),
+                    Line::from("Tour passé."),
+                ],
+                help: "Entrée : continuer   ·   q : quitter",
+                hl: None,
+            };
+            if !pause(terminal, &screen, Duration::from_millis(1500))? {
                 return Ok(());
             }
         } else if to_move == Player::White {
-            match human_select(terminal, &board, &plays, roll, ai.label())? {
-                Some(i) => board = plays[i].clone(),
-                None => return Ok(()), // l'utilisateur a quitté
+            // Ton tour : tu joues les pions au clavier sur le plateau.
+            match human_turn(terminal, &board, &plays, roll, ai.label())? {
+                Some(b) => board = b,
+                None => return Ok(()), // tu as quitté
             }
         } else {
-            // On montre d'abord les dés de l'IA, *avant* qu'elle joue.
-            let msg = vec![
-                Line::from("L'IA a lancé les dés."),
-                Line::from("Une touche : elle joue."),
-            ];
-            if !wait(terminal, &view, to_move, roll, ai.label(), "Au tour de l'IA", msg)? {
-                return Ok(());
-            }
-            // Puis elle joue, et on révèle le plateau après son coup.
+            // Tour de l'IA : elle choisit, joue, et on révèle la position. On
+            // reprend automatiquement après un court délai (ou dès qu'une touche
+            // est pressée), pour ne pas avoir à valider à la main.
             let i = ai.choose(&plays);
             board = plays[i].clone();
-            let view_after = white_view(&board, to_move);
-            let msg = vec![
-                Line::from("L'IA a joué son tour."),
-                Line::from("Observe le plateau."),
-            ];
-            if !wait(terminal, &view_after, to_move, roll, ai.label(), "L'IA a joué", msg)? {
+            let view = white_view(&board, to_move);
+            let screen = Screen {
+                view: &view,
+                to_move,
+                roll,
+                opp: ai.label(),
+                title: "L'IA a joué",
+                panel: vec![
+                    Line::from("L'IA a joué son coup."),
+                    Line::from(""),
+                    Line::from(Span::styled("Reprise automatique…", dim())),
+                ],
+                help: "Entrée : continuer tout de suite   ·   q : quitter",
+                hl: None,
+            };
+            if !pause(terminal, &screen, Duration::from_millis(1500))? {
                 return Ok(());
             }
         }
@@ -118,15 +157,17 @@ fn run_game(terminal: &mut DefaultTerminal, ai: &Ai) -> io::Result<()> {
                 Player::White => format!("Tu gagnes ! ({points} point(s)) 🎉"),
                 Player::Black => format!("L'IA gagne ({points} point(s))."),
             };
-            wait(
-                terminal,
-                &view_final,
+            let screen = Screen {
+                view: &view_final,
                 to_move,
                 roll,
-                ai.label(),
-                "Fin de la partie",
-                vec![Line::from(label), Line::from("Une touche pour quitter.")],
-            )?;
+                opp: ai.label(),
+                title: "Fin de la partie",
+                panel: vec![Line::from(label), Line::from("Une touche pour quitter.")],
+                help: "une touche pour quitter",
+                hl: None,
+            };
+            wait_key(terminal, &screen)?;
             return Ok(());
         }
 
@@ -135,94 +176,541 @@ fn run_game(terminal: &mut DefaultTerminal, ai: &Ai) -> io::Result<()> {
     }
 }
 
-// --- Boucle de saisie du joueur ---------------------------------------------
+// --- Saisie d'un coup, pion par pion, au clavier -----------------------------
 
-/// Laisse l'humain parcourir les coups possibles et en choisir un. Renvoie
-/// `None` s'il quitte.
-fn human_select(
+/// D'où part un pion qu'on déplace : une case du plateau, ou la barre.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Src {
+    Point(usize),
+    Bar,
+}
+
+/// Où arrive un pion : une case du plateau, ou la sortie (bear off).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dst {
+    Point(usize),
+    Off,
+}
+
+/// Un déplacement d'un seul dé : sa valeur, sa source, sa destination, et la
+/// position obtenue. `next` est une position **complète** du moteur.
+#[derive(Clone)]
+struct SubMove {
+    die: u8,
+    src: Src,
+    dst: Dst,
+    next: Board,
+}
+
+/// Laisse l'humain composer son coup au clavier. `finals` = `legal_plays`, la
+/// liste (non vide) des positions complètes légales. Renvoie la position
+/// choisie, ou `None` s'il quitte.
+fn human_turn(
     terminal: &mut DefaultTerminal,
-    board: &Board,
-    plays: &[Board],
+    start: &Board,
+    finals: &[Board],
     roll: Roll,
     opp: &str,
-) -> io::Result<Option<usize>> {
-    let mut sel = 0usize;
+) -> io::Result<Option<Board>> {
+    let mut cur = start.clone();
+    // Les valeurs de dés qu'on doit encore jouer (en respectant l'usage maximal).
+    let initial_dice = maximal_dice(start, &roll);
+    let mut dice_left = initial_dice.clone();
+
+    // Curseur : on le place d'emblée sur une case jouable (ou une case d'entrée
+    // si un pion est sur la barre).
+    let init_moves = available_moves(&cur, &dice_left, finals);
+    let mut cursor = init_moves
+        .iter()
+        .find_map(|m| match (m.src, m.dst) {
+            (Src::Bar, Dst::Point(p)) => Some(p),     // entrée depuis la barre
+            (Src::Point(p), _) => Some(p),            // case jouable
+            _ => None,
+        })
+        .unwrap_or(0);
+
+    // `picked` = la source qu'on a « prise en main » (None tant qu'on n'a rien
+    // pris). Pile pour annuler un sous-coup (touche `u`).
+    let mut picked: Option<Src> = None;
+    let mut history: Vec<(Board, Vec<u8>, usize)> = Vec::new();
+
     loop {
-        let panel: Vec<Line<'static>> = plays
+        let moves = available_moves(&cur, &dice_left, finals);
+        let complete = moves.is_empty(); // plus aucun dé jouable = coup terminé
+
+        // Si le seul coup possible est de rentrer de la barre, on prend la barre
+        // en main automatiquement (rien d'autre n'est permis).
+        let must_bar = !complete && moves.iter().all(|m| matches!(m.src, Src::Bar));
+        if must_bar && picked.is_none() {
+            picked = Some(Src::Bar);
+        }
+
+        // Les coups « actifs » = ceux qu'on peut jouer là, tout de suite : depuis
+        // la source prise en main, ou (sinon) depuis la case sous le curseur.
+        let active: Vec<&SubMove> = match picked {
+            Some(s) => moves.iter().filter(|m| m.src == s).collect(),
+            None => moves
+                .iter()
+                .filter(|m| m.src == Src::Point(cursor))
+                .collect(),
+        };
+
+        // Surbrillances à dessiner.
+        let preview_dests: Vec<usize> = active
             .iter()
-            .enumerate()
-            .map(|(i, cand)| {
-                let text = format!(" {:>2}. {} ", i + 1, describe(board, cand));
-                if i == sel {
-                    Line::from(Span::styled(
-                        text,
-                        Style::default().fg(Color::Black).bg(HUMAN),
-                    ))
-                } else {
-                    Line::from(text)
-                }
+            .filter_map(|m| match m.dst {
+                Dst::Point(p) => Some(p),
+                Dst::Off => None,
             })
             .collect();
+        let sources: Vec<usize> = if picked.is_some() {
+            Vec::new()
+        } else {
+            let mut v = Vec::new();
+            for m in &moves {
+                if let Src::Point(p) = m.src
+                    && !v.contains(&p)
+                {
+                    v.push(p);
+                }
+            }
+            v
+        };
+        let picked_src = match picked {
+            Some(Src::Point(p)) => Some(p),
+            _ => None,
+        };
+        let hl = Hl {
+            cursor,
+            sources,
+            picked_src,
+            preview_dests,
+        };
 
+        let panel = turn_panel(&dice_left, &active, picked, must_bar, complete);
+        let help = if complete {
+            "Entrée : valider   ·   u : annuler   ·   q : quitter"
+        } else {
+            "hjkl : déplacer   ·   Entrée : jouer   ·   1-6 : choisir le dé   ·   u : annuler   ·   q : quitter"
+        };
         let screen = Screen {
-            view: board,
+            view: &cur,
             to_move: Player::White,
             roll,
             opp,
-            title: "Coups possibles",
+            title: if complete { "Coup terminé" } else { "Ton coup" },
             panel,
-            help: "↑/↓ choisir   Entrée valider   q quitter",
+            help,
+            hl: Some(hl),
         };
         draw(terminal, &screen)?;
 
-        if let Event::Key(k) = event::read()? {
-            if k.kind != KeyEventKind::Press {
-                continue;
-            }
-            match k.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    sel = if sel == 0 { plays.len() - 1 } else { sel - 1 };
+        // --- Lecture d'une touche ---
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k.code,
+            _ => continue,
+        };
+
+        if complete {
+            // Le coup est entièrement joué : on valide, on annule, ou on quitte.
+            match key {
+                KeyCode::Enter | KeyCode::Char(' ') => return Ok(Some(cur)),
+                KeyCode::Char('u') => {
+                    if let Some((b, dl, c)) = history.pop() {
+                        cur = b;
+                        dice_left = dl;
+                        cursor = c;
+                        picked = None;
+                    }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    sel = (sel + 1) % plays.len();
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => return Ok(Some(sel)),
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
                 _ => {}
             }
+            continue;
+        }
+
+        match key {
+            // Déplacement du curseur (hjkl ou flèches).
+            KeyCode::Char('h') | KeyCode::Left => cursor = move_cursor(cursor, 'h'),
+            KeyCode::Char('l') | KeyCode::Right => cursor = move_cursor(cursor, 'l'),
+            KeyCode::Char('k') | KeyCode::Up => cursor = move_cursor(cursor, 'k'),
+            KeyCode::Char('j') | KeyCode::Down => cursor = move_cursor(cursor, 'j'),
+
+            // Entrée : prendre une case en main, ou jouer vers une destination.
+            KeyCode::Enter | KeyCode::Char(' ') => match picked {
+                Some(src) => {
+                    // On joue vers la case sous le curseur si c'est une
+                    // destination ; sinon, s'il n'y a qu'un coup, on le joue.
+                    let target = cursor; // copie : la closure ne doit pas emprunter `cursor`
+                    let played = apply_move(
+                        &moves,
+                        |m| m.src == src && m.dst == Dst::Point(target),
+                        &mut cur,
+                        &mut dice_left,
+                        &mut cursor,
+                        &mut picked,
+                        &mut history,
+                    );
+                    if !played && active.len() == 1 {
+                        apply_move(
+                            &moves,
+                            |m| m.src == src,
+                            &mut cur,
+                            &mut dice_left,
+                            &mut cursor,
+                            &mut picked,
+                            &mut history,
+                        );
+                    }
+                }
+                None => {
+                    let target = cursor; // copie : la closure ne doit pas emprunter `cursor`
+                    let from: Vec<&SubMove> = moves
+                        .iter()
+                        .filter(|m| m.src == Src::Point(target))
+                        .collect();
+                    match from.len() {
+                        0 => {} // pas une case jouable
+                        1 => {
+                            apply_move(
+                                &moves,
+                                |m| m.src == Src::Point(target),
+                                &mut cur,
+                                &mut dice_left,
+                                &mut cursor,
+                                &mut picked,
+                                &mut history,
+                            );
+                        }
+                        _ => {
+                            // Plusieurs destinations : on prend la case en main et
+                            // on amène le curseur sur la première destination.
+                            picked = Some(Src::Point(cursor));
+                            if let Some(p) = from.iter().find_map(|m| match m.dst {
+                                Dst::Point(p) => Some(p),
+                                Dst::Off => None,
+                            }) {
+                                cursor = p;
+                            }
+                        }
+                    }
+                }
+            },
+
+            // 1-6 : jouer directement avec ce dé (pratique pour la sortie).
+            KeyCode::Char(c @ '1'..='6') => {
+                let d = c as u8 - b'0';
+                let src = picked.unwrap_or(if must_bar {
+                    Src::Bar
+                } else {
+                    Src::Point(cursor)
+                });
+                apply_move(
+                    &moves,
+                    |m| m.src == src && m.die == d,
+                    &mut cur,
+                    &mut dice_left,
+                    &mut cursor,
+                    &mut picked,
+                    &mut history,
+                );
+            }
+
+            // Annuler la prise en main, ou le dernier sous-coup.
+            KeyCode::Esc => {
+                if picked.is_some() && !must_bar {
+                    picked = None;
+                } else {
+                    return Ok(None);
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Some((b, dl, c)) = history.pop() {
+                    cur = b;
+                    dice_left = dl;
+                    cursor = c;
+                    picked = None;
+                }
+            }
+            KeyCode::Char('r') => {
+                cur = start.clone();
+                dice_left = initial_dice.clone();
+                history.clear();
+                picked = None;
+            }
+            KeyCode::Char('q') => return Ok(None),
+            _ => {}
         }
     }
 }
 
-/// Affiche un écran et attend une touche. Renvoie `false` si l'utilisateur veut
-/// quitter (`q`/Échap).
-fn wait(
-    terminal: &mut DefaultTerminal,
-    view: &Board,
-    to_move: Player,
-    roll: Roll,
-    opp: &str,
-    title: &str,
-    panel: Vec<Line<'static>>,
-) -> io::Result<bool> {
-    let screen = Screen {
-        view,
-        to_move,
-        roll,
-        opp,
-        title,
-        panel,
-        help: "une touche pour continuer   q quitter",
-    };
-    draw(terminal, &screen)?;
-    loop {
-        if let Event::Key(k) = event::read()? {
-            if k.kind == KeyEventKind::Press {
-                return Ok(!matches!(k.code, KeyCode::Char('q') | KeyCode::Esc));
-            }
+/// Joue le premier coup de `moves` satisfaisant `pred` : empile l'état pour
+/// l'annulation, retire le dé utilisé, avance le plateau et place le curseur sur
+/// la destination. Renvoie `true` si un coup a été joué.
+#[allow(clippy::too_many_arguments)]
+fn apply_move(
+    moves: &[SubMove],
+    pred: impl Fn(&SubMove) -> bool,
+    cur: &mut Board,
+    dice_left: &mut Vec<u8>,
+    cursor: &mut usize,
+    picked: &mut Option<Src>,
+    history: &mut Vec<(Board, Vec<u8>, usize)>,
+) -> bool {
+    if let Some(m) = moves.iter().find(|m| pred(m)) {
+        history.push((cur.clone(), dice_left.clone(), *cursor));
+        *dice_left = without_one(dice_left, m.die);
+        if let Dst::Point(p) = m.dst {
+            *cursor = p;
+        }
+        *cur = m.next.clone();
+        *picked = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Le contenu du panneau de droite pendant ton coup : dés restants, et la liste
+/// (courte) des déplacements possibles depuis la source courante.
+fn turn_panel(
+    dice_left: &[u8],
+    active: &[&SubMove],
+    picked: Option<Src>,
+    must_bar: bool,
+    complete: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Dés restants  ", dim()),
+        Span::styled(fmt_dice_left(dice_left), fg(HUMAN)),
+    ])];
+    lines.push(Line::from(""));
+
+    if complete {
+        lines.push(Line::from("Coup terminé."));
+        lines.push(Line::from("Entrée pour valider."));
+        return lines;
+    }
+
+    if must_bar {
+        lines.push(Line::from("Pion sur la barre :"));
+        lines.push(Line::from("fais-le rentrer."));
+    } else if picked.is_some() {
+        lines.push(Line::from("Choisis la destination :"));
+    } else if active.is_empty() {
+        lines.push(Line::from("Place le curseur sur"));
+        lines.push(Line::from("un pion ● jouable,"));
+        lines.push(Line::from("puis Entrée."));
+        return lines;
+    } else {
+        lines.push(Line::from("Coups possibles :"));
+    }
+
+    for m in active {
+        let dst = match m.dst {
+            Dst::Point(p) => format!("case {p}"),
+            Dst::Off => "sortie".to_string(),
+        };
+        lines.push(Line::from(format!("  dé {} → {}", m.die, dst)));
+    }
+    lines
+}
+
+fn fmt_dice_left(dl: &[u8]) -> String {
+    if dl.is_empty() {
+        "—".to_string()
+    } else {
+        dl.iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join("  ")
+    }
+}
+
+// --- Logique des sous-coups (dé par dé) --------------------------------------
+
+/// Les valeurs de dés que le coup *maximal* doit jouer, dans l'ordre du lancer.
+/// (Mêmes règles que `legal_plays` : on joue le plus de dés possible ; à défaut,
+/// le plus grand dé pour un non-double.)
+fn maximal_dice(board: &Board, roll: &Roll) -> Vec<u8> {
+    if roll.d1 == roll.d2 {
+        let n = longest_double_chain(board, roll.d1, 4);
+        vec![roll.d1; n]
+    } else if uses_both(board, roll.d1, roll.d2) {
+        vec![roll.d1, roll.d2]
+    } else {
+        let large = roll.d1.max(roll.d2);
+        let small = roll.d1.min(roll.d2);
+        if !board.single_die_moves(large).is_empty() {
+            vec![large]
+        } else if !board.single_die_moves(small).is_empty() {
+            vec![small]
+        } else {
+            Vec::new()
         }
     }
 }
+
+/// Longueur de la plus longue suite de coups d'un même dé (pour les doubles).
+fn longest_double_chain(board: &Board, die: u8, remaining: usize) -> usize {
+    if remaining == 0 {
+        return 0;
+    }
+    let mut best = 0;
+    for next in board.single_die_moves(die) {
+        best = best.max(1 + longest_double_chain(&next, die, remaining - 1));
+    }
+    best
+}
+
+/// Peut-on jouer les deux dés `a` et `b` (dans un ordre ou l'autre) ?
+fn uses_both(board: &Board, a: u8, b: u8) -> bool {
+    board
+        .single_die_moves(a)
+        .iter()
+        .any(|n| !n.single_die_moves(b).is_empty())
+        || board
+            .single_die_moves(b)
+            .iter()
+            .any(|n| !n.single_die_moves(a).is_empty())
+}
+
+/// Les sous-coups jouables depuis `cur` qui **mènent encore** à une position
+/// finale légale (en jouant ensuite tous les dés restants). C'est ce filtre qui
+/// garantit qu'on respecte l'usage maximal des dés tout au long de la saisie.
+fn available_moves(cur: &Board, dice_left: &[u8], finals: &[Board]) -> Vec<SubMove> {
+    let mut out = Vec::new();
+    for d in distinct(dice_left) {
+        let rem = without_one(dice_left, d);
+        for next in cur.single_die_moves(d) {
+            let ok = if rem.is_empty() {
+                finals.contains(&next)
+            } else {
+                can_reach_final(&next, &rem, finals)
+            };
+            if ok {
+                let (src, dst) = diff_move(cur, &next);
+                out.push(SubMove {
+                    die: d,
+                    src,
+                    dst,
+                    next,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Depuis `b`, en jouant exactement les dés `rem`, peut-on atteindre une
+/// position de `finals` ?
+fn can_reach_final(b: &Board, rem: &[u8], finals: &[Board]) -> bool {
+    if rem.is_empty() {
+        return finals.contains(b);
+    }
+    for d in distinct(rem) {
+        let r2 = without_one(rem, d);
+        for next in b.single_die_moves(d) {
+            if can_reach_final(&next, &r2, finals) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Déduit (source, destination) d'un sous-coup en comparant `cur` et `next`.
+/// Un seul de tes pions a bougé : on trouve la case qui en a perdu un (source)
+/// et celle qui en a gagné un (destination).
+fn diff_move(cur: &Board, next: &Board) -> (Src, Dst) {
+    let (cp, np) = (cur.points(), next.points());
+
+    let src = if next.bar()[0] < cur.bar()[0] {
+        Src::Bar
+    } else {
+        let mut s = Src::Bar;
+        for p in 0..24 {
+            if np[p].max(0) == cp[p].max(0) - 1 {
+                s = Src::Point(p);
+                break;
+            }
+        }
+        s
+    };
+
+    let dst = if next.off()[0] > cur.off()[0] {
+        Dst::Off
+    } else {
+        let mut d = Dst::Off;
+        for p in 0..24 {
+            if np[p].max(0) == cp[p].max(0) + 1 {
+                d = Dst::Point(p);
+                break;
+            }
+        }
+        d
+    };
+
+    (src, dst)
+}
+
+/// Les valeurs distinctes d'une liste de dés (pour ne pas explorer deux fois le
+/// même dé).
+fn distinct(v: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &d in v {
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// La même liste, privée d'une occurrence de `d`.
+fn without_one(v: &[u8], d: u8) -> Vec<u8> {
+    let mut out = v.to_vec();
+    if let Some(pos) = out.iter().position(|&x| x == d) {
+        out.remove(pos);
+    }
+    out
+}
+
+// --- Déplacement du curseur sur la grille ------------------------------------
+
+/// Position (rangée, colonne) d'une case dans la grille visuelle.
+/// rangée 0 = haut, 1 = bas ; colonne 0..11 de gauche à droite.
+fn locate(p: usize) -> (usize, usize) {
+    if let Some(c) = TOP_IDX.iter().position(|&x| x == p) {
+        (0, c)
+    } else {
+        (1, BOT_IDX.iter().position(|&x| x == p).unwrap())
+    }
+}
+
+/// L'index moteur à la position (rangée, colonne).
+fn grid_index(row: usize, col: usize) -> usize {
+    if row == 0 {
+        TOP_IDX[col]
+    } else {
+        BOT_IDX[col]
+    }
+}
+
+/// Déplace le curseur d'une case selon `h`/`j`/`k`/`l`. `k` monte vers la
+/// rangée du haut, `j` descend vers celle du bas (en gardant la colonne).
+fn move_cursor(cur: usize, key: char) -> usize {
+    let (mut row, mut col) = locate(cur);
+    match key {
+        'h' => col = col.saturating_sub(1),
+        'l' => col = (col + 1).min(11),
+        'k' => row = 0,
+        'j' => row = 1,
+        _ => {}
+    }
+    grid_index(row, col)
+}
+
+// --- L'adversaire ------------------------------------------------------------
 
 /// L'adversaire : l'heuristique, ou un réseau entraîné chargé depuis un fichier.
 enum Ai {
@@ -256,7 +744,51 @@ impl Ai {
     }
 }
 
+// --- Attente / temporisation -------------------------------------------------
+
+/// Affiche un écran et attend : soit qu'une touche soit pressée, soit que
+/// `dur` s'écoule (reprise automatique). Renvoie `false` si l'utilisateur veut
+/// quitter (`q`/Échap), `true` sinon.
+fn pause(terminal: &mut DefaultTerminal, s: &Screen, dur: Duration) -> io::Result<bool> {
+    draw(terminal, s)?;
+    let start = Instant::now();
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= dur {
+            return Ok(true); // délai écoulé : on reprend
+        }
+        // `poll` attend un événement au plus le temps restant ; on ne lit
+        // (`read`) que s'il y en a un, d'où le `&&` qui court-circuite.
+        if event::poll(dur - elapsed)?
+            && let Event::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+        {
+            return Ok(!matches!(k.code, KeyCode::Char('q') | KeyCode::Esc));
+        }
+    }
+}
+
+/// Affiche un écran et attend (sans limite de temps) qu'une touche soit pressée.
+fn wait_key(terminal: &mut DefaultTerminal, s: &Screen) -> io::Result<()> {
+    draw(terminal, s)?;
+    loop {
+        if let Event::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+        {
+            return Ok(());
+        }
+    }
+}
+
 // --- Rendu -------------------------------------------------------------------
+
+/// Les surbrillances à dessiner sur le plateau pendant la saisie d'un coup.
+struct Hl {
+    cursor: usize,
+    sources: Vec<usize>,
+    picked_src: Option<usize>,
+    preview_dests: Vec<usize>,
+}
 
 /// Tout ce qu'il faut pour dessiner une frame. Regroupé pour alléger les appels.
 struct Screen<'a> {
@@ -267,6 +799,7 @@ struct Screen<'a> {
     title: &'a str,
     panel: Vec<Line<'static>>,
     help: &'a str,
+    hl: Option<Hl>,
 }
 
 /// Un cadre arrondi, à bord discret et titre coloré.
@@ -281,16 +814,17 @@ fn panel_block(title: &str, accent: Color) -> Block<'static> {
 }
 
 /// Dessine une frame complète : le plateau à gauche ; à droite les infos, les
-/// dés, puis le panneau variable (coups ou message) ; une ligne d'aide en bas.
+/// dés, puis le panneau variable ; une ligne d'aide en bas.
 fn render(f: &mut Frame, s: &Screen) {
     let area = f.area();
     let [content, help_area] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     let [board_area, side] =
-        Layout::horizontal([Constraint::Length(43), Constraint::Min(28)]).areas(content);
+        Layout::horizontal([Constraint::Length(51), Constraint::Min(28)]).areas(content);
 
     f.render_widget(
-        Paragraph::new(board_lines(s.view)).block(panel_block("Backgammon", ACCENT)),
+        Paragraph::new(board_lines(s.view, s.hl.as_ref()))
+            .block(panel_block("Backgammon", ACCENT)),
         board_area,
     );
 
@@ -481,7 +1015,34 @@ fn make_col(v: i8) -> Col {
     Col { cells }
 }
 
-/// Assemble 12 champs (3 caractères chacun) en une ligne, barre au milieu.
+/// Le fond (background) d'une case, selon les surbrillances. Ordre de priorité :
+/// destination > case prise en main > source jouable > curseur.
+fn point_bg(p: usize, hl: Option<&Hl>) -> Option<Color> {
+    let hl = hl?;
+    if hl.preview_dests.contains(&p) {
+        Some(DST_BG)
+    } else if hl.picked_src == Some(p) {
+        Some(PICK_BG)
+    } else if hl.sources.contains(&p) {
+        Some(SRC_BG)
+    } else if hl.cursor == p {
+        Some(CURSOR_BG)
+    } else {
+        None
+    }
+}
+
+/// Une cellule de 4 caractères de large (` x  `), avec couleur de pion et fond
+/// éventuel.
+fn styled_cell(ch: char, fg_color: Color, bg: Option<Color>) -> Span<'static> {
+    let mut st = Style::default().fg(fg_color);
+    if let Some(b) = bg {
+        st = st.bg(b);
+    }
+    Span::styled(format!(" {ch}  "), st)
+}
+
+/// Assemble 12 champs (4 caractères chacun) en une ligne, barre au milieu.
 fn fields_to_line(fields: Vec<Span<'static>>) -> Line<'static> {
     let mut spans = Vec::with_capacity(fields.len() + 1);
     for (k, sp) in fields.into_iter().enumerate() {
@@ -493,10 +1054,25 @@ fn fields_to_line(fields: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
-fn label_line(idx: &[usize; 12]) -> Line<'static> {
+/// La ligne des numéros de cases. La case sous le curseur est mise en évidence
+/// (texte sombre sur fond doré), toujours visible quel que soit le thème.
+fn label_line(idx: &[usize; 12], hl: Option<&Hl>) -> Line<'static> {
+    let cursor = hl.map(|h| h.cursor);
     let fields = idx
         .iter()
-        .map(|i| Span::styled(format!("{i:>3}"), dim()))
+        .map(|&i| {
+            if cursor == Some(i) {
+                Span::styled(
+                    format!(" {i:>2} "),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(format!(" {i:>2} "), fg(LABEL))
+            }
+        })
         .collect();
     fields_to_line(fields)
 }
@@ -504,18 +1080,27 @@ fn label_line(idx: &[usize; 12]) -> Line<'static> {
 /// Une rangée de cellules. Les cases vides reçoivent le triangle de la bande
 /// (`▼` en haut, `▲` en bas), en teinte alternée — claire/foncée — et opposée
 /// entre le haut et le bas, comme sur un vrai plateau.
-fn cells_line(cols: &[Col], depth: usize, top: bool) -> Line<'static> {
+fn cells_line(
+    cols: &[Col],
+    idx: &[usize; 12],
+    depth: usize,
+    top: bool,
+    hl: Option<&Hl>,
+) -> Line<'static> {
     let glyph = if top { '▼' } else { '▲' };
     let base = if top { 0 } else { 1 };
     let fields = cols
         .iter()
         .enumerate()
-        .map(|(k, c)| match c.cells[depth] {
-            Some((ch, color)) => Span::styled(format!(" {ch} "), fg(color)),
-            None => {
-                let light = (k + base) % 2 == 0;
-                let band = if light { BAND_LIGHT } else { BAND_DARK };
-                Span::styled(format!(" {glyph} "), fg(band))
+        .map(|(k, c)| {
+            let bg = point_bg(idx[k], hl);
+            match c.cells[depth] {
+                Some((ch, color)) => styled_cell(ch, color, bg),
+                None => {
+                    let light = (k + base) % 2 == 0;
+                    let band = if light { BAND_LIGHT } else { BAND_DARK };
+                    styled_cell(glyph, band, bg)
+                }
             }
         })
         .collect();
@@ -525,30 +1110,28 @@ fn cells_line(cols: &[Col], depth: usize, top: bool) -> Line<'static> {
 /// Le trait horizontal qui sépare les deux moitiés, croisé par la barre.
 fn mid_rule() -> Line<'static> {
     Line::from(vec![
-        Span::styled("─".repeat(18), dim()),
+        Span::styled("─".repeat(24), dim()),
         Span::styled("╋", fg(BAR_COLOR)),
-        Span::styled("─".repeat(18), dim()),
+        Span::styled("─".repeat(24), dim()),
     ])
 }
 
-/// Rend le plateau (vu des Blancs) en lignes colorées.
-fn board_lines(b: &Board) -> Vec<Line<'static>> {
-    let top_idx: [usize; 12] = [23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12];
-    let bot_idx: [usize; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+/// Rend le plateau (vu des Blancs) en lignes colorées, avec les surbrillances.
+fn board_lines(b: &Board, hl: Option<&Hl>) -> Vec<Line<'static>> {
     let pts = b.points();
-    let top: Vec<Col> = top_idx.iter().map(|&i| make_col(pts[i])).collect();
-    let bot: Vec<Col> = bot_idx.iter().map(|&i| make_col(pts[i])).collect();
+    let top: Vec<Col> = TOP_IDX.iter().map(|&i| make_col(pts[i])).collect();
+    let bot: Vec<Col> = BOT_IDX.iter().map(|&i| make_col(pts[i])).collect();
 
     let mut lines = Vec::new();
-    lines.push(label_line(&top_idx));
+    lines.push(label_line(&TOP_IDX, hl));
     for d in 0..H {
-        lines.push(cells_line(&top, d, true));
+        lines.push(cells_line(&top, &TOP_IDX, d, true, hl));
     }
     lines.push(mid_rule());
     for d in (0..H).rev() {
-        lines.push(cells_line(&bot, d, false));
+        lines.push(cells_line(&bot, &BOT_IDX, d, false, hl));
     }
-    lines.push(label_line(&bot_idx));
+    lines.push(label_line(&BOT_IDX, hl));
     lines.push(Line::from(""));
 
     let bar = b.bar();
@@ -564,49 +1147,6 @@ fn board_lines(b: &Board) -> Vec<Line<'static>> {
     lines
 }
 
-/// Décrit le coup menant de `cur` à `cand` (bilan net : d'où partent tes pions,
-/// où ils arrivent ; `✗` marque une frappe). `cur` et `cand` sont vus du même
-/// côté que celui qui joue (pions positifs = à lui).
-fn describe(cur: &Board, cand: &Board) -> String {
-    let (cp, ap) = (cur.points(), cand.points());
-    let (cb, ab) = (cur.bar(), cand.bar());
-    let (co, ao) = (cur.off(), cand.off());
-
-    let mut sources: Vec<String> = Vec::new();
-    let mut dests: Vec<String> = Vec::new();
-
-    let bar_in = cb[0] as i32 - ab[0] as i32;
-    for _ in 0..bar_in.max(0) {
-        sources.push("barre".to_string());
-    }
-
-    for p in (0..24).rev() {
-        let cm = if cp[p] > 0 { cp[p] as i32 } else { 0 };
-        let am = if ap[p] > 0 { ap[p] as i32 } else { 0 };
-        let d = am - cm;
-        if d < 0 {
-            for _ in 0..(-d) {
-                sources.push(p.to_string());
-            }
-        } else if d > 0 {
-            for _ in 0..d {
-                dests.push(p.to_string());
-            }
-        }
-    }
-
-    let off_out = ao[0] as i32 - co[0] as i32;
-    for _ in 0..off_out.max(0) {
-        dests.push("sortie".to_string());
-    }
-
-    let mut s = format!("{} → {}", sources.join(","), dests.join(","));
-    if ab[1] > cb[1] {
-        s.push_str(" ✗"); // frappe d'un pion adverse
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,27 +1157,26 @@ mod tests {
     fn le_rendu_ne_panique_pas_et_contient_le_plateau() {
         let board = Board::starting_position();
         let roll = Roll { d1: 3, d2: 1 };
-        let plays = legal_plays(&board, &roll);
-        let panel: Vec<Line<'static>> = plays
-            .iter()
-            .map(|c| Line::from(describe(&board, c)))
-            .collect();
 
         let screen = Screen {
             view: &board,
             to_move: Player::White,
             roll,
             opp: "heuristique",
-            title: "Coups",
-            panel,
+            title: "Ton coup",
+            panel: vec![Line::from("coups")],
             help: "aide",
+            hl: None,
         };
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| render(f, &screen)).unwrap();
 
         let screen = format!("{}", terminal.backend());
-        assert!(screen.contains("Backgammon"), "le titre du plateau doit apparaître");
+        assert!(
+            screen.contains("Backgammon"),
+            "le titre du plateau doit apparaître"
+        );
         assert!(screen.contains("Infos"), "le panneau d'infos doit apparaître");
     }
 
@@ -654,6 +1193,59 @@ mod tests {
         for n in 1..=6u8 {
             let count: usize = pip_grid(n).iter().flatten().filter(|&&b| b).count();
             assert_eq!(count, n as usize, "la face {n} doit avoir {n} points");
+        }
+    }
+
+    /// Vérifie qu'en composant le coup dé par dé (via `available_moves`), on
+    /// retombe **exactement** sur l'ensemble des positions de `legal_plays`.
+    /// C'est l'invariant central de la saisie interactive.
+    fn collect_finals(cur: &Board, dice_left: &[u8], finals: &[Board], out: &mut Vec<Board>) {
+        if dice_left.is_empty() {
+            if !out.contains(cur) {
+                out.push(cur.clone());
+            }
+            return;
+        }
+        for m in available_moves(cur, dice_left, finals) {
+            let rem = without_one(dice_left, m.die);
+            collect_finals(&m.next, &rem, finals, out);
+        }
+    }
+
+    fn assert_saisie_couvre_tout(board: &Board, roll: Roll) {
+        let finals = legal_plays(board, &roll);
+        let dice_left = maximal_dice(board, &roll);
+        let mut reached = Vec::new();
+        collect_finals(board, &dice_left, &finals, &mut reached);
+
+        for f in &finals {
+            assert!(
+                reached.contains(f),
+                "une position légale n'est pas atteignable pion par pion (roll {:?})",
+                roll
+            );
+        }
+        for r in &reached {
+            assert!(
+                finals.contains(r),
+                "la saisie atteint une position illégale (roll {:?})",
+                roll
+            );
+        }
+    }
+
+    #[test]
+    fn saisie_incrementale_couvre_legal_plays() {
+        let start = Board::starting_position();
+        for roll in [
+            Roll { d1: 3, d2: 1 },
+            Roll { d1: 6, d2: 5 },
+            Roll { d1: 2, d2: 4 },
+            Roll { d1: 5, d2: 5 }, // double
+            Roll { d1: 6, d2: 6 }, // double bloqué au départ
+            Roll { d1: 1, d2: 1 },
+        ] {
+            assert_saisie_couvre_tout(&start, roll);
         }
     }
 }
