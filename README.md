@@ -25,21 +25,30 @@ in a few hundred lines of readable Rust.
 
 - **A complete, correct backgammon engine**: full legal-move generation (bar
   re-entry has priority, doubles, the "play the larger die" rule, bearing off,
-  hits), and end-of-game detection (single / *gammon* / *backgammon*).
-- **A terminal UI** (TUI, built with [Ratatui](https://ratatui.rs)): a board
-  drawn with its wooden points, dice shown on screen, and move entry done
+  hits), end-of-game detection (single / *gammon* / *backgammon*), and full
+  **doubling-cube** support.
+- **A terminal UI** (TUI, built with [Ratatui](https://ratatui.rs)): a menu, a
+  board drawn with its wooden points, dice shown on screen, and move entry done
   **one checker at a time from the keyboard**, with the legal sources and
-  destinations highlighted.
-- **A three-tier AI**, from simplest to smartest:
+  destinations highlighted. Pick the **difficulty level**, propose or answer a
+  **double**, and watch a running **win/loss scoreboard** that persists between
+  sessions.
+- **A dice-fairness tool**: a built-in **χ² goodness-of-fit test** that checks
+  the dice really are uniform (the RNG is the audited [`rand`](https://docs.rs/rand)
+  crate, not a hand-rolled generator).
+- **A six-tier AI**, from simplest to smartest:
   1. a **random** agent (training sparring partner and test harness);
   2. a **heuristic** agent (a weighted sum of positional features) that beats
      random play ~99% of the time;
   3. a **neural network** trained by self-play with **TD(λ)**, which beats the
-     heuristic.
+     heuristic;
+  4. **expectiminimax** with chance nodes (1 then 2 plies of look-ahead);
+  5. **Monte-Carlo rollouts** that decide close calls by playing games out.
 - **Weight persistence**: train the network once, save it, and the TUI plays
   against it.
-- **28 automated tests** (`cargo test`) covering the rules, the evaluation, the
-  backpropagation and the training loop.
+- **45 automated tests** (`cargo test --workspace`) covering the rules, the
+  doubling cube, the evaluation, the backpropagation, the training loop, the
+  search and the dice statistics.
 
 ---
 
@@ -50,12 +59,14 @@ Requirements: [Rust](https://rustup.rs) (2024 edition, tested with `rustc 1.95`)
 ### Play a game
 
 ```bash
-cargo run
+cargo run            # debug build (fine up to the "Expert" level)
+cargo run --release  # recommended for the "Maître" / "Légende" levels
 ```
 
-You play **White** (cyan checkers) against the AI (red checkers). If no network
-has been trained yet, the AI uses the heuristic; otherwise it loads the trained
-network from `net.txt`.
+A **menu** lets you choose the difficulty level (`←/→`), open the dice
+statistics screen, or start playing. You play **White** (cyan checkers) against
+the AI (red checkers). If no network has been trained yet, the network-based
+levels fall back to the heuristic.
 
 #### Keyboard controls
 
@@ -64,8 +75,10 @@ network from `net.txt`.
 | `h` `j` `k` `l` / arrows | Move the cursor around the board                            |
 | `Enter`                 | Pick up the checker under the cursor, then choose its target |
 | `1`–`6`                 | Play a die of that exact value directly (handy for bearing off) |
+| `d`                     | Propose a **double** (before rolling, when you may)         |
+| `a` / `r`               | **Accept** / **refuse** a double the AI offers you          |
 | `u`                     | Undo the last sub-move                                       |
-| `r`                     | Restart the move from scratch                                |
+| `r`                     | Restart the move from scratch                               |
 | `Esc` / `q`             | Quit                                                         |
 
 The orientation matches a real board: **your home (inner) board is bottom-right**,
@@ -78,7 +91,7 @@ and you move your checkers toward it to bear them off.
 cargo run --release --bin train -- 5000
 
 # then play again: the TUI loads the trained network automatically
-cargo run
+cargo run --release
 ```
 
 The tool prints progress (win rate vs random and vs heuristic) as training goes,
@@ -100,8 +113,8 @@ Arguments: `train -- [games] [hidden_neurons] [alpha] [lambda]`.
 ### Run the tests
 
 ```bash
-cargo test                 # the fast suite (23 tests + 4 TUI tests)
-cargo test -- --ignored    # + the real training test (~45 s)
+cargo test --workspace          # the fast suite (45 tests)
+cargo test --workspace -- --ignored   # + the real training test (~45 s)
 ```
 
 ---
@@ -150,46 +163,72 @@ RandomAgent  →  HeuristicAgent  →  Neural network (untrained)
                                           │
                                           ▼
                             Network that beats the heuristic
+                                          │
+                              ┌───────────┴───────────┐
+                              ▼                       ▼
+                     Expectiminimax            Monte-Carlo
+                     (chance nodes)              rollouts
 ```
 
 The key abstraction is the **`Evaluator`** trait: "know how to score a position."
-A generic **`GreedyAgent<E>`** plays the `argmax` of any evaluator. The heuristic
-**and** the network thus reuse the exact same choice logic.
+A generic **`GreedyAgent<E>`** plays the `argmax` of any evaluator; the search
+agents (`ExpectiAgent`, `RolloutAgent`) wrap the same evaluator to look deeper.
+The heuristic **and** the network thus reuse the exact same choice logic.
 
-**1. The heuristic** (`agent/heuristic.rs`) — a differential weighted sum: lead in
+**1. The heuristic** (`ai/heuristic.rs`) — a differential weighted sum: lead in
 the race (*pip count*), checkers borne off, opponent checkers on the bar, *blots*
 exposed to a hit, made points in the inner board, overall structure. It's
 **antisymmetric** (`evaluate(swap(b)) == -evaluate(b)`) and beats random play
 ~99.5% of the time.
 
-**2. The encoding** (`encoding.rs`) — each position becomes a vector of **196
+**2. The encoding** (`ai/encoding.rs`) — each position becomes a vector of **196
 inputs**, in the spirit of Tesauro's encoding: for each point and each player, 4
 units describe the checker count (≥1, ≥2, ≥3, and the surplus), plus the bar and
 the borne-off checkers. (The original uses 198; the 2 "whose turn" units are
 useless here since the board is already normalized.)
 
-**3. The network** (`net.rs`) — a hand-coded **single-hidden-layer perceptron**:
-`196 inputs → sigmoid hidden layer → 1 sigmoid output`. The output is the
-**estimated probability that the player to move wins**. It's all there: forward
-pass, backpropagation (`output_gradient`), gradient step, and lossless
-save/load of the weights.
+**3. The network** (`ai/net.rs`) — a hand-coded **single-hidden-layer
+perceptron**: `196 inputs → sigmoid hidden layer → 6 sigmoid outputs`. The six
+outputs are the probabilities of each game outcome **from the player-to-move's
+point of view**: win / gammon / backgammon, and the symmetric three losses. The
+position's **equity** — its expected number of points, in `[-3, +3]` — is what
+the agent maximizes, so it tells "winning" apart from "winning big." It's all
+there: forward pass, backpropagation, gradient step, and lossless save/load.
 
-**4. TD(λ) training** (`train.rs`) — the network plays against itself. After every
-move, we nudge the previous prediction toward its target (the value of the next
-move, then the actual outcome at game's end), using **eligibility traces** that
-spread the signal back to earlier moves. This is pure reinforcement learning: no
-human games, no database — just play against yourself.
+**4. TD(λ) training** (`ai/train.rs`) — the network plays against itself. After
+every move, we nudge the previous prediction toward its target (the value of the
+next move, then the actual one-hot outcome at game's end), using **eligibility
+traces** that spread the signal back to earlier moves. This is pure reinforcement
+learning: no human games, no database — just play against yourself.
 
-> 💡 **The most instructive bug in the project.** The network's value depends on
-> *who* is moving. Accumulating the gradient naively into the trace mixed
-> *P(White wins)* and *P(Black wins)* — two opposite quantities — and training
-> **diverged** (the network collapsed back below 50% vs random). The fix:
-> express everything in a single **canonical value** `U = P(White wins)`, and
-> **sign the gradient by the current perspective**. It's documented in detail in
-> `train.rs`.
+> 💡 **The most instructive bug in the project.** The network's outputs depend
+> on *who* is moving. Accumulating the gradient naively into the traces mixed
+> *White's* and *Black's* outcomes — opposite quantities — and training
+> **diverged**. The fix: express everything in a single **canonical** outcome
+> vector seen from White, and **permute the gradients by the current
+> perspective** (a player's wins are the opponent's losses). It's documented in
+> detail in `train.rs`.
+
+**5. Look-ahead search** (`ai/search.rs`) — at play time the agent can look
+deeper than the greedy policy:
+
+- **Expectiminimax** adds **chance nodes**: it can't know the opponent's roll, so
+  it averages the value of the opponent's best reply over all 21 dice rolls,
+  weighted by probability (1/36 for a double, 2/36 otherwise). `plies = 1` looks
+  at the reply, `plies = 2` adds our counter-reply. Each extra ply costs ~21×, so
+  only the top few candidates (by static evaluation) are explored deeply.
+- **Monte-Carlo rollouts** decide close calls by **actually playing** the rest of
+  the game many times (both sides greedy, random dice) and averaging the points —
+  an unbiased estimate of the true value.
+
+**6. The doubling cube** (`engine/game.rs`) — the full cube is modelled: who owns
+it, the current stake, and the legal right to double. The cube-aware agents use a
+simple equity rule (double when you're a 65–95% favorite; take down to ~25%),
+and the final score is multiplied by the cube. The TUI lets you propose and
+answer doubles, and tallies the resulting points.
 
 **Results** (hidden layer of 40 neurons, α = 0.1, λ = 0, a few thousand games):
-**~100% wins against random** and **~65–69% against the heuristic**. So the
+**~100% wins against random** and **~60–69% against the heuristic**. So the
 network surpasses the baseline it was meant to beat. The learning curve is typical
 of self-play TD: a fast rise, a small transient dip around 2,000–4,000 games, then
 a strong recovery.
@@ -198,31 +237,40 @@ a strong recovery.
 
 ## 🗂️ Code layout
 
-A single crate, split into clear modules (a migration to a multi-crate
-*workspace* is planned as the AI grows).
+A Cargo **workspace** split into three crates: the dependency-free **engine**,
+the **ai** (which depends only on the engine), and the **cli** front-end (which
+depends on both).
 
-| File                    | Role                                                                |
-| ----------------------- | ------------------------------------------------------------------- |
-| `board.rs`              | The board, the starting position, `swap_perspective`, single-die moves, win detection |
-| `dice.rs`               | The dice (dependency-free *xorshift* generator) and a roll          |
-| `moves.rs`              | `legal_plays`: dice composition and the mandatory-use rules         |
-| `player.rs`             | The `Player` enum (White / Black)                                   |
-| `game.rs`               | A game's state and the play loop between two agents                 |
-| `agent.rs`              | The `Agent` trait (human, random, AI…)                             |
-| `agent/random.rs`       | Random agent                                                        |
-| `agent/heuristic.rs`    | Heuristic evaluation + agent                                        |
-| `agent/human.rs`        | Command-line human agent (+ ASCII board rendering)                  |
-| `eval.rs`               | The `Evaluator` trait and the generic `GreedyAgent<E>`              |
-| `encoding.rs`           | Encoding a position into 196 inputs (Tesauro-style)                |
-| `net.rs`                | The neural network: forward, backprop, save/load                    |
-| `train.rs`              | The self-play TD(λ) training and the win-rate measurements          |
-| `bin/train.rs`          | The command-line training executable                                |
-| `tui.rs`                | The terminal UI (Ratatui)                                           |
+```
+crates/
+├── engine/   # the game, no display & no AI dependencies
+│   ├── board.rs      # board, starting position, swap_perspective, single-die moves, win detection
+│   ├── dice.rs       # the dice (rand-crate RNG), a roll, the 21 weighted rolls
+│   ├── moves.rs      # legal_plays: dice composition and the mandatory-use rules
+│   ├── player.rs     # the Player enum (White / Black)
+│   ├── game.rs       # game state, the play loop, and the doubling Cube
+│   ├── stats.rs      # the χ² dice-fairness test
+│   ├── agent.rs      # the Agent trait (+ doubling hooks)
+│   └── agent/        # random.rs, human.rs (console)
+├── ai/       # learning & search; depends on engine
+│   ├── encoding.rs   # a position → 196 inputs (Tesauro-style)
+│   ├── eval.rs       # the Evaluator trait, GreedyAgent<E>, cube heuristics
+│   ├── heuristic.rs  # the heuristic evaluation + agent
+│   ├── net.rs        # the 6-output neural network: forward, backprop, save/load
+│   ├── search.rs     # ExpectiAgent (expectiminimax) + RolloutAgent (Monte-Carlo)
+│   └── train.rs      # the self-play TD(λ) training and win-rate measurements
+└── cli/      # the front-end; depends on engine + ai
+    ├── main.rs       # entry point (launches the TUI)
+    ├── tui.rs        # the terminal UI: menu, board, dice, cube, dice-stats screen
+    ├── scores.rs     # the persistent win/loss scoreboard
+    └── bin/train.rs  # the command-line training executable
+```
 
 ### Tech stack
 
 - **Rust** (2024 edition), no `unsafe`.
 - [**Ratatui**](https://ratatui.rs) + [**crossterm**](https://github.com/crossterm-rs/crossterm) for the TUI.
+- [**rand**](https://docs.rs/rand) for the dice (a proper, audited RNG).
 - Neural network, backprop and TD(λ) **coded by hand** — no `tch`, `burn` or
   `candle` (to be reconsidered if the network grows).
 
@@ -230,12 +278,13 @@ A single crate, split into clear modules (a migration to a multi-crate
 
 ## 🛣️ What's next
 
-- [ ] **Expectiminimax** with chance nodes + Monte-Carlo **rollouts** at play
-      time (look one move deeper than the current greedy policy).
-- [ ] **Multiple** network outputs: separate win / gammon / backgammon
-      probabilities for each side.
-- [ ] **Doubling cube** support.
-- [ ] Migration to a multi-crate **workspace** (engine / cli / ai / gui).
+- [x] **Expectiminimax** with chance nodes + Monte-Carlo **rollouts** at play time.
+- [x] **Multiple** network outputs: win / gammon / backgammon probabilities.
+- [x] **Doubling cube** support.
+- [x] Migration to a multi-crate **workspace** (engine / ai / cli).
+- [ ] A graphical front-end (`gui` crate).
+- [ ] Cube-aware **rollouts** and a learned doubling policy.
+- [ ] A larger / deeper network, possibly via `tch` or `burn`.
 
 ---
 

@@ -20,6 +20,5 @@ pub trait Agent {
     }
 }
 
-pub mod heuristic;
 pub mod human;
 pub mod random;

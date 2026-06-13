@@ -5,8 +5,8 @@
 
 use std::time::Instant;
 
-use backgammon::net::Net;
-use backgammon::train::{train_self_play, win_rate_vs_heuristic, win_rate_vs_random};
+use ai::net::Net;
+use ai::train::{train_self_play, win_rate_vs_heuristic, win_rate_vs_random};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

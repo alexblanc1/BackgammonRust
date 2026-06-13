@@ -19,6 +19,12 @@ impl RandomAgent {
             dice: Dice::new(seed),
         }
     }
+
+    /// Avec une source d'aléa fournie (par ex. `Dice::random()` pour un
+    /// adversaire imprévisible d'une partie à l'autre).
+    pub fn with_dice(dice: Dice) -> RandomAgent {
+        RandomAgent { dice }
+    }
 }
 
 impl Agent for RandomAgent {

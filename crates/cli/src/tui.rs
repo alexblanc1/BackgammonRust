@@ -5,14 +5,19 @@
 //! Blancs (le joueur humain) ; on retourne la position pour l'affichage quand
 //! c'est l'IA qui vient de jouer.
 //!
+//! Au lancement, un **menu** permet de choisir le niveau de l'IA, de consulter
+//! l'outil de **vérification statistique des dés** (test du χ²), et de voir le
+//! **score cumulé** (sauvegardé dans `scores.txt`).
+//!
 //! Orientation : ta base (jan intérieur) est en **bas à droite**, l'adversaire
 //! démarre en **haut à droite**, comme sur un vrai plateau.
 //!
 //! Saisie d'un coup : tu déplaces un curseur sur le plateau avec `hjkl`, les
 //! coups possibles s'affichent en surbrillance, et tu joues pion par pion.
+//! Avant ton lancer, tu peux proposer un **videau** (touche `d`).
 
 use std::io;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
@@ -22,12 +27,20 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
 
-use backgammon::agent::heuristic::evaluate;
-use backgammon::board::Board;
-use backgammon::dice::{Dice, Roll};
-use backgammon::moves::legal_plays;
-use backgammon::net::Net;
-use backgammon::player::Player;
+use engine::agent::Agent;
+use ai::heuristic::{HeuristicEvaluator, heuristic_agent};
+use engine::agent::random::RandomAgent;
+use engine::board::Board;
+use engine::dice::{Dice, Roll};
+use ai::eval::GreedyAgent;
+use engine::game::{Cube, GameState, Phase};
+use engine::moves::legal_plays;
+use ai::net::Net;
+use engine::player::Player;
+use ai::search::{ExpectiAgent, RolloutAgent};
+use engine::stats::{CHI2_THRESHOLD_5PCT, DiceStats};
+
+use crate::scores::{SCORES_FILE, Scores};
 
 /// Hauteur d'affichage d'une pile de pions (plus grand = plus lisible).
 const H: usize = 6;
@@ -69,34 +82,481 @@ fn fg(c: Color) -> Style {
     Style::default().fg(c)
 }
 
+// --- Niveaux de difficulté -----------------------------------------------------
+
+/// Les niveaux proposés dans le menu. Chacun fabrique un agent différent ;
+/// les trois derniers préfèrent le réseau entraîné (`net.txt`) et retombent
+/// sur l'heuristique s'il n'y en a pas.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Difficulty {
+    /// Coups au hasard.
+    Facile,
+    /// L'heuristique gloutonne (pas d'apprentissage).
+    Moyen,
+    /// Le réseau entraîné, glouton (0 coup d'avance).
+    Difficile,
+    /// Réseau + expectiminimax : intègre la meilleure réponse adverse sur les
+    /// 21 lancers possibles (1 demi-coup d'avance).
+    Expert,
+    /// Réseau + expectiminimax sur 2 demi-coups (la réponse adverse **et**
+    /// notre réplique). Lent en mode debug : préférer `cargo run --release`.
+    Maitre,
+    /// Réseau + rollouts Monte-Carlo : les meilleurs candidats sont départagés
+    /// en jouant réellement des fins de partie. Le plus fort — et le plus lent.
+    Legende,
+}
+
+impl Difficulty {
+    const ALL: [Difficulty; 6] = [
+        Difficulty::Facile,
+        Difficulty::Moyen,
+        Difficulty::Difficile,
+        Difficulty::Expert,
+        Difficulty::Maitre,
+        Difficulty::Legende,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Difficulty::Facile => "Facile",
+            Difficulty::Moyen => "Moyen",
+            Difficulty::Difficile => "Difficile",
+            Difficulty::Expert => "Expert",
+            Difficulty::Maitre => "Maître",
+            Difficulty::Legende => "Légende",
+        }
+    }
+
+    /// Description de l'adversaire réellement construit (dépend de la
+    /// présence d'un réseau entraîné).
+    fn label(self, has_net: bool) -> &'static str {
+        match self {
+            Difficulty::Facile => "coups aléatoires",
+            Difficulty::Moyen => "heuristique",
+            Difficulty::Difficile if has_net => "réseau (glouton)",
+            Difficulty::Difficile => "heuristique (pas de net.txt)",
+            Difficulty::Expert if has_net => "réseau + expectiminimax",
+            Difficulty::Expert => "heuristique + expectiminimax",
+            Difficulty::Maitre if has_net => "réseau + expectiminimax 2 plis",
+            Difficulty::Maitre => "heuristique + expectiminimax 2 plis",
+            Difficulty::Legende if has_net => "réseau + rollouts Monte-Carlo",
+            Difficulty::Legende => "heuristique + rollouts Monte-Carlo",
+        }
+    }
+
+    /// Construit l'agent correspondant. `Box<dyn Agent>` : les niveaux rendent
+    /// des types concrets différents, on les unifie derrière le trait.
+    fn agent(self, net: Option<&Net>) -> Box<dyn Agent> {
+        match self {
+            Difficulty::Facile => Box::new(RandomAgent::with_dice(Dice::random())),
+            Difficulty::Moyen => Box::new(heuristic_agent()),
+            Difficulty::Difficile => match net {
+                Some(n) => Box::new(GreedyAgent::new(n.clone())),
+                None => Box::new(heuristic_agent()),
+            },
+            Difficulty::Expert => match net {
+                Some(n) => Box::new(ExpectiAgent::new(n.clone(), 1, 5)),
+                None => Box::new(ExpectiAgent::new(HeuristicEvaluator::new(), 1, 5)),
+            },
+            Difficulty::Maitre => match net {
+                Some(n) => Box::new(ExpectiAgent::new(n.clone(), 2, 5)),
+                None => Box::new(ExpectiAgent::new(HeuristicEvaluator::new(), 2, 5)),
+            },
+            Difficulty::Legende => match net {
+                Some(n) => Box::new(RolloutAgent::with_dice(n.clone(), 24, 4, Dice::random())),
+                None => Box::new(RolloutAgent::with_dice(
+                    HeuristicEvaluator::new(),
+                    24,
+                    4,
+                    Dice::random(),
+                )),
+            },
+        }
+    }
+}
+
 // --- Point d'entrée ----------------------------------------------------------
 
-/// Prépare le terminal, joue la partie, puis restaure le terminal.
+/// Prépare le terminal, affiche le menu, puis restaure le terminal.
 pub fn run() -> io::Result<()> {
     // Si un réseau entraîné a été sauvegardé (`cargo run --release --bin train`),
-    // on joue contre lui ; sinon, contre l'heuristique.
-    let ai = match Net::load("net.txt") {
-        Ok(net) => Ai::Net(net),
-        Err(_) => Ai::Heuristic,
-    };
+    // les niveaux Difficile/Expert/Maître jouent avec ; sinon, heuristique.
+    let net = Net::load("net.txt").ok();
+    let mut scores = Scores::load(SCORES_FILE);
 
     let mut terminal = ratatui::init();
-    let result = run_game(&mut terminal, &ai);
+    let result = run_app(&mut terminal, net.as_ref(), &mut scores);
     ratatui::restore();
     result
 }
 
-fn run_game(terminal: &mut DefaultTerminal, ai: &Ai) -> io::Result<()> {
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x1234_5678);
-    let mut dice = Dice::new(seed | 1);
+/// Ce que le menu demande de faire.
+enum MenuAction {
+    Play,
+    DiceStats,
+    Quit,
+}
+
+/// Comment se termine une partie, du point de vue de la boucle principale.
+enum After {
+    Rematch,
+    Menu,
+    Quit,
+}
+
+fn run_app(
+    terminal: &mut DefaultTerminal,
+    net: Option<&Net>,
+    scores: &mut Scores,
+) -> io::Result<()> {
+    let mut difficulty = if net.is_some() {
+        Difficulty::Expert
+    } else {
+        Difficulty::Moyen
+    };
+
+    loop {
+        match menu(terminal, &mut difficulty, net.is_some(), scores)? {
+            MenuAction::Quit => return Ok(()),
+            MenuAction::DiceStats => dice_stats_screen(terminal)?,
+            MenuAction::Play => loop {
+                // Un agent neuf par partie (certains portent un état interne).
+                let mut agent = difficulty.agent(net);
+                let label = difficulty.label(net.is_some());
+                match run_game(terminal, agent.as_mut(), label, scores)? {
+                    After::Rematch => continue,
+                    After::Menu => break,
+                    After::Quit => return Ok(()),
+                }
+            },
+        }
+    }
+}
+
+// --- Le menu -------------------------------------------------------------------
+
+fn menu(
+    terminal: &mut DefaultTerminal,
+    difficulty: &mut Difficulty,
+    has_net: bool,
+    scores: &Scores,
+) -> io::Result<MenuAction> {
+    // 0 = Jouer, 1 = Niveau, 2 = Stats des dés, 3 = Quitter.
+    let mut selected = 0usize;
+    const N_ITEMS: usize = 4;
+
+    loop {
+        terminal.draw(|f| render_menu(f, selected, *difficulty, has_net, scores))?;
+
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k.code,
+            _ => continue,
+        };
+        match key {
+            KeyCode::Char('k') | KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Char('j') | KeyCode::Down => selected = (selected + 1).min(N_ITEMS - 1),
+            // ←/→ règlent le niveau, qu'on soit sur la ligne « Niveau » ou non.
+            KeyCode::Char('h') | KeyCode::Left => {
+                let i = Difficulty::ALL.iter().position(|d| d == difficulty).unwrap();
+                *difficulty = Difficulty::ALL[i.saturating_sub(1)];
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                let i = Difficulty::ALL.iter().position(|d| d == difficulty).unwrap();
+                *difficulty = Difficulty::ALL[(i + 1).min(Difficulty::ALL.len() - 1)];
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match selected {
+                0 => return Ok(MenuAction::Play),
+                1 => {} // la ligne « Niveau » se règle avec ←/→
+                2 => return Ok(MenuAction::DiceStats),
+                _ => return Ok(MenuAction::Quit),
+            },
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(MenuAction::Quit),
+            _ => {}
+        }
+    }
+}
+
+fn render_menu(
+    f: &mut Frame,
+    selected: usize,
+    difficulty: Difficulty,
+    has_net: bool,
+    scores: &Scores,
+) {
+    let area = f.area();
+    let [content, help_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+
+    let item = |i: usize, text: String| -> Line<'static> {
+        if i == selected {
+            Line::from(vec![
+                Span::styled("  ▸ ", fg(ACCENT)),
+                Span::styled(text, Style::default().add_modifier(Modifier::BOLD)),
+            ])
+        } else {
+            Line::from(vec![Span::raw("    "), Span::raw(text)])
+        }
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  BACKGAMMON",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        item(0, "Jouer".to_string()),
+        item(
+            1,
+            format!("Niveau : ◂ {} ▸   (←/→)", difficulty.name()),
+        ),
+        item(2, "Statistiques des dés".to_string()),
+        item(3, "Quitter".to_string()),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Adversaire  ", dim()),
+            Span::raw(difficulty.label(has_net).to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Scores      ", dim()),
+            Span::raw(scores.summary()),
+        ]),
+    ];
+    if !has_net {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  (pas de net.txt : entraîne le réseau avec `cargo run --release --bin train`)",
+            dim(),
+        )));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).block(panel_block("Menu", ACCENT)),
+        content,
+    );
+    f.render_widget(
+        Paragraph::new("  jk : naviguer   ·   ←/→ : niveau   ·   Entrée : choisir   ·   q : quitter")
+            .style(dim()),
+        help_area,
+    );
+}
+
+// --- L'écran de statistiques des dés ------------------------------------------
+
+fn dice_stats_screen(terminal: &mut DefaultTerminal) -> io::Result<()> {
+    let mut rolls: u64 = 10_000;
+    let mut stats = DiceStats::collect(&mut Dice::random(), rolls);
+
+    loop {
+        terminal.draw(|f| render_dice_stats(f, &stats))?;
+
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k.code,
+            _ => continue,
+        };
+        match key {
+            KeyCode::Char('r') | KeyCode::Enter => {
+                stats = DiceStats::collect(&mut Dice::random(), rolls);
+            }
+            KeyCode::Char('+') => {
+                rolls = (rolls * 10).min(1_000_000);
+                stats = DiceStats::collect(&mut Dice::random(), rolls);
+            }
+            KeyCode::Char('-') => {
+                rolls = (rolls / 10).max(1_000);
+                stats = DiceStats::collect(&mut Dice::random(), rolls);
+            }
+            KeyCode::Char('q') | KeyCode::Char('m') | KeyCode::Esc => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
+fn render_dice_stats(f: &mut Frame, stats: &DiceStats) {
+    let area = f.area();
+    let [content, help_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+
+    let expected = 1.0 / 6.0;
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(format!(
+            "  {} lancers ({} dés) — fréquence attendue par face : 16,67 %",
+            stats.rolls,
+            stats.faces()
+        )),
+        Line::from(""),
+    ];
+
+    // Histogramme : une barre par face, 30 caractères ≈ la fréquence attendue.
+    for face in 1..=6u8 {
+        let freq = stats.frequency(face);
+        let bar_len = (freq / expected * 30.0).round() as usize;
+        let bar: String = "█".repeat(bar_len.min(60));
+        lines.push(Line::from(vec![
+            Span::styled(format!("  face {face}  "), dim()),
+            Span::styled(bar, fg(HUMAN)),
+            Span::raw(format!(
+                "  {:>6}  ({:.2} %)",
+                stats.counts[(face - 1) as usize],
+                freq * 100.0
+            )),
+        ]));
+    }
+
+    let chi2 = stats.chi2();
+    let ok = stats.uniform_at_5pct();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Doubles  ", dim()),
+        Span::raw(format!(
+            "{:.2} % (attendu 16,67 %)",
+            stats.doubles_frequency() * 100.0
+        )),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  χ²       ", dim()),
+        Span::raw(format!("{chi2:.2}  (seuil 5 % : {CHI2_THRESHOLD_5PCT})")),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("  Verdict : "),
+        if ok {
+            Span::styled(
+                "distribution compatible avec des dés équilibrés ✓",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                "χ² au-dessus du seuil — retire un échantillon (5 % des tirages honnêtes dépassent le seuil)",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )
+        },
+    ]));
+
+    f.render_widget(
+        Paragraph::new(lines).block(panel_block("Statistiques des dés (test du χ²)", ACCENT)),
+        content,
+    );
+    f.render_widget(
+        Paragraph::new("  r : nouveau tirage   ·   +/- : taille ×10 / ÷10   ·   m : retour au menu")
+            .style(dim()),
+        help_area,
+    );
+}
+
+// --- La partie -----------------------------------------------------------------
+
+/// Tout le contexte stable d'une partie, pour alléger les signatures.
+#[derive(Clone, Copy)]
+struct Ctx<'a> {
+    opp: &'a str,
+    cube: Cube,
+    scores: Scores,
+}
+
+fn run_game(
+    terminal: &mut DefaultTerminal,
+    ai: &mut dyn Agent,
+    opp: &str,
+    scores: &mut Scores,
+) -> io::Result<After> {
+    // Dés réellement imprévisibles : graine fournie par l'OS via la crate `rand`.
+    let mut dice = Dice::random();
 
     let mut board = Board::starting_position();
     let mut to_move = Player::White; // les Blancs (toi) commencent
+    let mut cube = Cube::new();
 
     loop {
+        let ctx = Ctx {
+            opp,
+            cube,
+            scores: *scores,
+        };
+
+        // --- Phase de videau : avant de lancer, le joueur au trait peut doubler.
+        if cube.may_double(to_move) {
+            if to_move == Player::White {
+                match human_preroll(terminal, &board, ctx)? {
+                    PreRoll::Roll => {}
+                    PreRoll::Quit => return Ok(After::Quit),
+                    PreRoll::Double => {
+                        let state = GameState {
+                            board: board.clone(),
+                            to_move,
+                            phase: Phase::AwaitingRoll,
+                            cube,
+                        };
+                        if ai.should_accept_double(&state) {
+                            cube.accept_double(Player::Black);
+                            let view = white_view(&board, to_move);
+                            let screen = Screen {
+                                view: &view,
+                                to_move,
+                                roll: None,
+                                ctx: Ctx { cube, ..ctx },
+                                title: "Double accepté",
+                                panel: vec![
+                                    Line::from(format!("L'IA accepte : la partie vaut {} points.", cube.value)),
+                                    Line::from("Le videau est à elle."),
+                                ],
+                                help: "Entrée : continuer   ·   q : quitter",
+                                hl: None,
+                            };
+                            if !pause(terminal, &screen, Duration::from_millis(1500))? {
+                                return Ok(After::Quit);
+                            }
+                        } else {
+                            // L'IA refuse : tu gagnes la mise courante.
+                            let pts = cube.value;
+                            scores.record_win(pts);
+                            let _ = scores.save(SCORES_FILE);
+                            return end_screen(
+                                terminal,
+                                &white_view(&board, to_move),
+                                to_move,
+                                None,
+                                Ctx { scores: *scores, ..ctx },
+                                format!("L'IA refuse ton double : tu gagnes {pts} point(s) ! 🎉"),
+                            );
+                        }
+                    }
+                }
+            } else {
+                let state = GameState {
+                    board: board.clone(),
+                    to_move,
+                    phase: Phase::AwaitingRoll,
+                    cube,
+                };
+                if ai.should_double(&state) {
+                    match ai_offers_double(terminal, &board, to_move, ctx)? {
+                        Decision::Accept => cube.accept_double(Player::White),
+                        Decision::Refuse => {
+                            let pts = cube.value;
+                            scores.record_loss(pts);
+                            let _ = scores.save(SCORES_FILE);
+                            return end_screen(
+                                terminal,
+                                &white_view(&board, to_move),
+                                to_move,
+                                None,
+                                Ctx { scores: *scores, ..ctx },
+                                format!("Tu refuses le double : l'IA gagne {pts} point(s)."),
+                            );
+                        }
+                        Decision::Quit => return Ok(After::Quit),
+                    }
+                }
+            }
+        }
+        let ctx = Ctx {
+            cube,
+            ..ctx
+        };
+
+        // --- Lancer et coup ---
         let roll = dice.roll();
         let plays = legal_plays(&board, &roll);
 
@@ -106,8 +566,8 @@ fn run_game(terminal: &mut DefaultTerminal, ai: &Ai) -> io::Result<()> {
             let screen = Screen {
                 view: &view,
                 to_move,
-                roll,
-                opp: ai.label(),
+                roll: Some(roll),
+                ctx,
                 title: "Pas de coup",
                 panel: vec![
                     Line::from(format!("{} ne peut pas jouer ce lancer.", who(to_move))),
@@ -117,26 +577,32 @@ fn run_game(terminal: &mut DefaultTerminal, ai: &Ai) -> io::Result<()> {
                 hl: None,
             };
             if !pause(terminal, &screen, Duration::from_millis(1500))? {
-                return Ok(());
+                return Ok(After::Quit);
             }
         } else if to_move == Player::White {
             // Ton tour : tu joues les pions au clavier sur le plateau.
-            match human_turn(terminal, &board, &plays, roll, ai.label())? {
+            match human_turn(terminal, &board, &plays, roll, ctx)? {
                 Some(b) => board = b,
-                None => return Ok(()), // tu as quitté
+                None => return Ok(After::Quit), // tu as quitté
             }
         } else {
             // Tour de l'IA : elle choisit, joue, et on révèle la position. On
             // reprend automatiquement après un court délai (ou dès qu'une touche
             // est pressée), pour ne pas avoir à valider à la main.
-            let i = ai.choose(&plays);
+            let state = GameState {
+                board: board.clone(),
+                to_move,
+                phase: Phase::AwaitingMove(roll),
+                cube,
+            };
+            let i = ai.choose_play(&state, &plays);
             board = plays[i].clone();
             let view = white_view(&board, to_move);
             let screen = Screen {
                 view: &view,
                 to_move,
-                roll,
-                opp: ai.label(),
+                roll: Some(roll),
+                ctx,
                 title: "L'IA a joué",
                 panel: vec![
                     Line::from("L'IA a joué son coup."),
@@ -147,32 +613,172 @@ fn run_game(terminal: &mut DefaultTerminal, ai: &Ai) -> io::Result<()> {
                 hl: None,
             };
             if !pause(terminal, &screen, Duration::from_millis(1500))? {
-                return Ok(());
+                return Ok(After::Quit);
             }
         }
 
         if let Some(points) = board.win_check() {
-            let view_final = white_view(&board, to_move);
+            let total = points as u32 * cube.value;
             let label = match to_move {
-                Player::White => format!("Tu gagnes ! ({points} point(s)) 🎉"),
-                Player::Black => format!("L'IA gagne ({points} point(s))."),
+                Player::White => {
+                    scores.record_win(total);
+                    format!("Tu gagnes ! ({total} point(s)) 🎉")
+                }
+                Player::Black => {
+                    scores.record_loss(total);
+                    format!("L'IA gagne ({total} point(s)).")
+                }
             };
-            let screen = Screen {
-                view: &view_final,
+            let _ = scores.save(SCORES_FILE);
+            return end_screen(
+                terminal,
+                &white_view(&board, to_move),
                 to_move,
-                roll,
-                opp: ai.label(),
-                title: "Fin de la partie",
-                panel: vec![Line::from(label), Line::from("Une touche pour quitter.")],
-                help: "une touche pour quitter",
-                hl: None,
-            };
-            wait_key(terminal, &screen)?;
-            return Ok(());
+                Some(roll),
+                Ctx { scores: *scores, ..ctx },
+                label,
+            );
         }
 
         board = board.swap_perspective();
         to_move = to_move.other();
+    }
+}
+
+/// L'écran de fin de partie : résultat, scores, et la suite (revanche/menu).
+fn end_screen(
+    terminal: &mut DefaultTerminal,
+    view: &Board,
+    to_move: Player,
+    roll: Option<Roll>,
+    ctx: Ctx,
+    label: String,
+) -> io::Result<After> {
+    let screen = Screen {
+        view,
+        to_move,
+        roll,
+        ctx,
+        title: "Fin de la partie",
+        panel: vec![
+            Line::from(label),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Scores  ", dim()),
+                Span::raw(ctx.scores.summary()),
+            ]),
+        ],
+        help: "r : revanche   ·   m : menu   ·   q : quitter",
+        hl: None,
+    };
+    draw(terminal, &screen)?;
+    loop {
+        if let Event::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+        {
+            match k.code {
+                KeyCode::Char('r') | KeyCode::Enter => return Ok(After::Rematch),
+                KeyCode::Char('m') => return Ok(After::Menu),
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(After::Quit),
+                _ => {}
+            }
+        }
+    }
+}
+
+// --- Le videau (doubling cube) --------------------------------------------------
+
+/// Ce que l'humain décide avant son lancer.
+enum PreRoll {
+    Roll,
+    Double,
+    Quit,
+}
+
+/// Avant ton lancer, si tu as le droit de doubler : lancer ou doubler ?
+fn human_preroll(terminal: &mut DefaultTerminal, board: &Board, ctx: Ctx) -> io::Result<PreRoll> {
+    let view = white_view(board, Player::White);
+    let screen = Screen {
+        view: &view,
+        to_move: Player::White,
+        roll: None,
+        ctx,
+        title: "À toi de lancer",
+        panel: vec![
+            Line::from("Entrée : lancer les dés."),
+            Line::from(""),
+            Line::from(format!(
+                "d : doubler la mise ({} → {}).",
+                ctx.cube.value,
+                ctx.cube.value * 2
+            )),
+            Line::from(Span::styled(
+                "(refuser un double concède la mise courante)",
+                dim(),
+            )),
+        ],
+        help: "Entrée : lancer   ·   d : doubler   ·   q : quitter",
+        hl: None,
+    };
+    draw(terminal, &screen)?;
+    loop {
+        if let Event::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+        {
+            match k.code {
+                KeyCode::Char('d') => return Ok(PreRoll::Double),
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(PreRoll::Quit),
+                _ => return Ok(PreRoll::Roll),
+            }
+        }
+    }
+}
+
+/// La réponse de l'humain à un double proposé par l'IA.
+enum Decision {
+    Accept,
+    Refuse,
+    Quit,
+}
+
+fn ai_offers_double(
+    terminal: &mut DefaultTerminal,
+    board: &Board,
+    to_move: Player,
+    ctx: Ctx,
+) -> io::Result<Decision> {
+    let view = white_view(board, to_move);
+    let screen = Screen {
+        view: &view,
+        to_move,
+        roll: None,
+        ctx,
+        title: "L'IA double !",
+        panel: vec![
+            Line::from(format!(
+                "L'IA propose de doubler la mise ({} → {}).",
+                ctx.cube.value,
+                ctx.cube.value * 2
+            )),
+            Line::from(""),
+            Line::from("a : accepter (le videau sera à toi)"),
+            Line::from(format!("r : refuser (l'IA gagne {} point(s))", ctx.cube.value)),
+        ],
+        help: "a : accepter   ·   r : refuser   ·   q : quitter",
+        hl: None,
+    };
+    draw(terminal, &screen)?;
+    loop {
+        if let Event::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+        {
+            match k.code {
+                KeyCode::Char('a') | KeyCode::Enter => return Ok(Decision::Accept),
+                KeyCode::Char('r') => return Ok(Decision::Refuse),
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(Decision::Quit),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -210,7 +816,7 @@ fn human_turn(
     start: &Board,
     finals: &[Board],
     roll: Roll,
-    opp: &str,
+    ctx: Ctx,
 ) -> io::Result<Option<Board>> {
     let mut cur = start.clone();
     // Les valeurs de dés qu'on doit encore jouer (en respectant l'usage maximal).
@@ -296,8 +902,8 @@ fn human_turn(
         let screen = Screen {
             view: &cur,
             to_move: Player::White,
-            roll,
-            opp,
+            roll: Some(roll),
+            ctx,
             title: if complete { "Coup terminé" } else { "Ton coup" },
             panel,
             help,
@@ -710,40 +1316,6 @@ fn move_cursor(cur: usize, key: char) -> usize {
     grid_index(row, col)
 }
 
-// --- L'adversaire ------------------------------------------------------------
-
-/// L'adversaire : l'heuristique, ou un réseau entraîné chargé depuis un fichier.
-enum Ai {
-    Heuristic,
-    Net(Net),
-}
-
-impl Ai {
-    /// Indice du coup que l'IA préfère (argmax de sa valeur).
-    fn choose(&self, plays: &[Board]) -> usize {
-        let mut best = 0usize;
-        let mut best_score = f64::NEG_INFINITY;
-        for (i, b) in plays.iter().enumerate() {
-            let s = match self {
-                Ai::Heuristic => evaluate(b),
-                Ai::Net(net) => net.value(b),
-            };
-            if s > best_score {
-                best_score = s;
-                best = i;
-            }
-        }
-        best
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            Ai::Heuristic => "heuristique",
-            Ai::Net(_) => "réseau entraîné",
-        }
-    }
-}
-
 // --- Attente / temporisation -------------------------------------------------
 
 /// Affiche un écran et attend : soit qu'une touche soit pressée, soit que
@@ -768,18 +1340,6 @@ fn pause(terminal: &mut DefaultTerminal, s: &Screen, dur: Duration) -> io::Resul
     }
 }
 
-/// Affiche un écran et attend (sans limite de temps) qu'une touche soit pressée.
-fn wait_key(terminal: &mut DefaultTerminal, s: &Screen) -> io::Result<()> {
-    draw(terminal, s)?;
-    loop {
-        if let Event::Key(k) = event::read()?
-            && k.kind == KeyEventKind::Press
-        {
-            return Ok(());
-        }
-    }
-}
-
 // --- Rendu -------------------------------------------------------------------
 
 /// Les surbrillances à dessiner sur le plateau pendant la saisie d'un coup.
@@ -794,8 +1354,9 @@ struct Hl {
 struct Screen<'a> {
     view: &'a Board,
     to_move: Player,
-    roll: Roll,
-    opp: &'a str,
+    /// Le lancer affiché ; `None` avant le lancer (faces vides).
+    roll: Option<Roll>,
+    ctx: Ctx<'a>,
     title: &'a str,
     panel: Vec<Line<'static>>,
     help: &'a str,
@@ -829,14 +1390,14 @@ fn render(f: &mut Frame, s: &Screen) {
     );
 
     let [info_area, dice_area, panel_area] = Layout::vertical([
-        Constraint::Length(5),
+        Constraint::Length(7),
         Constraint::Length(7),
         Constraint::Min(3),
     ])
     .areas(side);
 
     f.render_widget(
-        Paragraph::new(info_lines(s.to_move, s.opp, s.view))
+        Paragraph::new(info_lines(s.to_move, s.ctx, s.view))
             .block(panel_block("Infos", ACCENT).padding(Padding::horizontal(1))),
         info_area,
     );
@@ -860,20 +1421,34 @@ fn draw(terminal: &mut DefaultTerminal, s: &Screen) -> io::Result<()> {
     Ok(())
 }
 
-/// Les lignes du panneau « Infos » : tour courant, adversaire, pip counts.
-fn info_lines(to_move: Player, opp: &str, view: &Board) -> Vec<Line<'static>> {
+/// Les lignes du panneau « Infos » : tour courant, adversaire, pip counts,
+/// videau et scores.
+fn info_lines(to_move: Player, ctx: Ctx, view: &Board) -> Vec<Line<'static>> {
     let (human_pip, ai_pip) = pip_counts(view);
+    let cube_label = match ctx.cube.owner {
+        None => format!("{} (au milieu)", ctx.cube.value),
+        Some(Player::White) => format!("{} (à toi)", ctx.cube.value),
+        Some(Player::Black) => format!("{} (à l'IA)", ctx.cube.value),
+    };
     vec![
-        Line::from(vec![Span::styled("Tour   ", dim()), turn_span(to_move)]),
+        Line::from(vec![Span::styled("Tour    ", dim()), turn_span(to_move)]),
         Line::from(vec![
-            Span::styled("Contre ", dim()),
-            Span::raw(opp.to_string()),
+            Span::styled("Contre  ", dim()),
+            Span::raw(ctx.opp.to_string()),
         ]),
         Line::from(vec![
-            Span::styled("Pips   ", dim()),
+            Span::styled("Pips    ", dim()),
             Span::styled(format!("toi {human_pip}"), fg(HUMAN)),
             Span::styled("   ", dim()),
             Span::styled(format!("IA {ai_pip}"), fg(AI)),
+        ]),
+        Line::from(vec![
+            Span::styled("Videau  ", dim()),
+            Span::raw(cube_label),
+        ]),
+        Line::from(vec![
+            Span::styled("Scores  ", dim()),
+            Span::raw(ctx.scores.summary()),
         ]),
     ]
 }
@@ -914,22 +1489,29 @@ fn who(p: Player) -> &'static str {
 // --- Les dés ----------------------------------------------------------------
 
 /// Titre du cadre des dés : précise le double (joué 4 fois) le cas échéant.
-fn dice_title(roll: Roll) -> String {
-    if roll.d1 == roll.d2 {
-        format!("Dés — double de {} (×4)", roll.d1)
-    } else {
-        format!("Dés — {} & {}", roll.d1, roll.d2)
+fn dice_title(roll: Option<Roll>) -> String {
+    match roll {
+        None => "Dés — à lancer".to_string(),
+        Some(roll) if roll.d1 == roll.d2 => format!("Dés — double de {} (×4)", roll.d1),
+        Some(roll) => format!("Dés — {} & {}", roll.d1, roll.d2),
     }
 }
 
 /// Les deux dés dessinés côte à côte, colorés selon le joueur courant.
-fn dice_lines(roll: Roll, to_move: Player) -> Vec<Line<'static>> {
-    let color = match to_move {
-        Player::White => HUMAN,
-        Player::Black => AI,
+/// Avant le lancer (`None`), deux faces vides et grisées.
+fn dice_lines(roll: Option<Roll>, to_move: Player) -> Vec<Line<'static>> {
+    let color = match (roll, to_move) {
+        (None, _) => DIM,
+        (_, Player::White) => HUMAN,
+        (_, Player::Black) => AI,
     };
-    let left = die_face(roll.d1);
-    let right = die_face(roll.d2);
+    // La face 0 n'allume aucun point : parfaite pour « pas encore lancé ».
+    let (f1, f2) = match roll {
+        Some(r) => (r.d1, r.d2),
+        None => (0, 0),
+    };
+    let left = die_face(f1);
+    let right = die_face(f2);
     (0..5)
         .map(|r| {
             Line::from(vec![
@@ -1153,6 +1735,14 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    fn test_ctx() -> Ctx<'static> {
+        Ctx {
+            opp: "heuristique",
+            cube: Cube::new(),
+            scores: Scores::default(),
+        }
+    }
+
     #[test]
     fn le_rendu_ne_panique_pas_et_contient_le_plateau() {
         let board = Board::starting_position();
@@ -1161,8 +1751,8 @@ mod tests {
         let screen = Screen {
             view: &board,
             to_move: Player::White,
-            roll,
-            opp: "heuristique",
+            roll: Some(roll),
+            ctx: test_ctx(),
             title: "Ton coup",
             panel: vec![Line::from("coups")],
             help: "aide",
@@ -1181,6 +1771,48 @@ mod tests {
     }
 
     #[test]
+    fn le_rendu_sans_lancer_affiche_des_faces_vides() {
+        let board = Board::starting_position();
+        let screen = Screen {
+            view: &board,
+            to_move: Player::White,
+            roll: None,
+            ctx: test_ctx(),
+            title: "À toi de lancer",
+            panel: vec![Line::from("Entrée : lancer")],
+            help: "aide",
+            hl: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &screen)).unwrap();
+        let out = format!("{}", terminal.backend());
+        assert!(out.contains("à lancer"), "le titre des dés doit le signaler");
+    }
+
+    #[test]
+    fn le_menu_se_dessine() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let scores = Scores::default();
+        terminal
+            .draw(|f| render_menu(f, 0, Difficulty::Expert, true, &scores))
+            .unwrap();
+        let out = format!("{}", terminal.backend());
+        assert!(out.contains("BACKGAMMON"));
+        assert!(out.contains("Niveau"));
+    }
+
+    #[test]
+    fn l_ecran_de_stats_se_dessine() {
+        let mut dice = Dice::new(99);
+        let stats = DiceStats::collect(&mut dice, 5_000);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| render_dice_stats(f, &stats)).unwrap();
+        let out = format!("{}", terminal.backend());
+        assert!(out.contains("face 1"));
+        assert!(out.contains("Verdict"));
+    }
+
+    #[test]
     fn pip_count_position_de_depart() {
         // Position de départ : pip count standard = 167 pour chacun.
         let (human, ai) = pip_counts(&Board::starting_position());
@@ -1194,6 +1826,8 @@ mod tests {
             let count: usize = pip_grid(n).iter().flatten().filter(|&&b| b).count();
             assert_eq!(count, n as usize, "la face {n} doit avoir {n} points");
         }
+        // La face « 0 » (pas encore lancé) n'allume rien.
+        assert_eq!(pip_grid(0).iter().flatten().filter(|&&b| b).count(), 0);
     }
 
     /// Vérifie qu'en composant le coup dé par dé (via `available_moves`), on

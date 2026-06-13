@@ -1,10 +1,18 @@
-[package]
-name = "backgammon"
+# Workspace multi-crates : le moteur de jeu (engine), l'IA (ai) et
+# l'interface en ligne de commande (cli). `cargo run` lance la TUI
+# (default-members) ; `cargo test --workspace` teste les trois crates.
+
+[workspace]
+resolver = "3"
+members = ["crates/engine", "crates/ai", "crates/cli"]
+default-members = ["crates/cli"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-crossterm = "0.29.0"
-ndarray = "0.17.2"
+[workspace.dependencies]
+backgammon-engine = { path = "crates/engine" }
+backgammon-ai = { path = "crates/ai" }
 rand = "0.10.1"
 ratatui = "0.30.0"

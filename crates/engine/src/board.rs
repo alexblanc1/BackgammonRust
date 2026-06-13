@@ -29,6 +29,13 @@ impl Board {
         }
     }
 
+    /// Construit un plateau arbitraire. Les champs étant privés hors du
+    /// moteur, c'est la porte d'entrée des autres crates (positions de test,
+    /// puzzles…). Aucune validation : à toi de fournir une position sensée.
+    pub fn from_parts(points: [i8; 24], bar: [u8; 2], off: [u8; 2]) -> Board {
+        Board { points, bar, off }
+    }
+
     /// Renvoie le plateau vu du point de vue de l'autre joueur.
     pub fn swap_perspective(&self) -> Board {
         let mut points = [0i8; 24];

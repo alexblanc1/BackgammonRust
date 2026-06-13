@@ -1,0 +1,14 @@
+# L'intelligence artificielle : encodage des positions, réseau de neurones,
+# évaluateurs, heuristique, recherche (expectiminimax, rollouts) et
+# entraînement TD(λ) par self-play.
+
+[package]
+name = "backgammon-ai"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "ai"
+
+[dependencies]
+backgammon-engine.workspace = true

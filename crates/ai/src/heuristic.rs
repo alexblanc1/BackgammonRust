@@ -4,7 +4,7 @@
 //! de critères. Elle sert d'adversaire correct et de point de comparaison pour
 //! les versions futures (le réseau de neurones devra la battre).
 
-use crate::board::Board;
+use engine::board::Board;
 use crate::eval::{Evaluator, GreedyAgent};
 
 /// L'évaluateur heuristique. Sans état : il délègue à la fonction `evaluate`.
@@ -46,8 +46,8 @@ pub fn evaluate(b: &Board) -> f64 {
     let opp = b.swap_perspective();
 
     let pip_diff = pip(&opp) as f64 - pip(b) as f64; // + = je suis devant dans la course
-    let off_diff = b.off[0] as f64 - b.off[1] as f64;
-    let bar_diff = b.bar[1] as f64 - b.bar[0] as f64; // + = l'adversaire est sur la barre
+    let off_diff = b.off()[0] as f64 - b.off()[1] as f64;
+    let bar_diff = b.bar()[1] as f64 - b.bar()[0] as f64; // + = l'adversaire est sur la barre
     let blot_diff = hittable_blots(&opp) as f64 - hittable_blots(b) as f64;
     let home_diff = home_points(b) as f64 - home_points(&opp) as f64;
     let made_diff = made_points(b) as f64 - made_points(&opp) as f64;
@@ -65,11 +65,11 @@ pub fn evaluate(b: &Board) -> f64 {
 fn pip(b: &Board) -> u32 {
     let mut total = 0u32;
     for p in 0..24 {
-        if b.points[p] > 0 {
-            total += b.points[p] as u32 * (p as u32 + 1);
+        if b.points()[p] > 0 {
+            total += b.points()[p] as u32 * (p as u32 + 1);
         }
     }
-    total + b.bar[0] as u32 * 25
+    total + b.bar()[0] as u32 * 25
 }
 
 /// Nombre de tes blots (cases à exactement 1 pion à toi) exposés à une frappe
@@ -79,18 +79,18 @@ fn pip(b: &Board) -> u32 {
 fn hittable_blots(b: &Board) -> u32 {
     let mut n = 0;
     for p in 0..24usize {
-        if b.points[p] != 1 {
+        if b.points()[p] != 1 {
             continue; // pas un blot à toi
         }
         let mut hittable = false;
         let lo = p.saturating_sub(6);
         for q in lo..p {
-            if b.points[q] < 0 {
+            if b.points()[q] < 0 {
                 hittable = true; // tir direct d'un pion adverse situé derrière
                 break;
             }
         }
-        if !hittable && b.bar[1] > 0 && p < 6 {
+        if !hittable && b.bar()[1] > 0 && p < 6 {
             hittable = true; // frappe possible à l'entrée depuis la barre adverse
         }
         if hittable {
@@ -102,22 +102,22 @@ fn hittable_blots(b: &Board) -> u32 {
 
 /// Nombre de tes points faits (≥ 2 pions) dans ton jan intérieur (index 0..6).
 fn home_points(b: &Board) -> u32 {
-    (0..6).filter(|&p| b.points[p] >= 2).count() as u32
+    (0..6).filter(|&p| b.points()[p] >= 2).count() as u32
 }
 
 /// Nombre total de tes points faits (≥ 2 pions) sur le plateau.
 fn made_points(b: &Board) -> u32 {
-    (0..24).filter(|&p| b.points[p] >= 2).count() as u32
+    (0..24).filter(|&p| b.points()[p] >= 2).count() as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::Agent;
-    use crate::agent::random::RandomAgent;
-    use crate::dice::Dice;
-    use crate::game::play;
-    use crate::player::Player;
+    use engine::agent::Agent;
+    use engine::agent::random::RandomAgent;
+    use engine::dice::Dice;
+    use engine::game::play;
+    use engine::player::Player;
 
     #[test]
     fn position_de_depart_neutre() {
@@ -137,11 +137,7 @@ mod tests {
         points[11] = -5;
         points[16] = -3;
         points[18] = -4;
-        let b = Board {
-            points,
-            bar: [0, 0],
-            off: [0, 0],
-        };
+        let b = Board::from_parts(points, [0, 0], [0, 0]);
         let s = evaluate(&b);
         let s_opp = evaluate(&b.swap_perspective());
         assert!((s + s_opp).abs() < 1e-9, "s={s}, s_opp={s_opp}");

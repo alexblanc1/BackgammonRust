@@ -5,7 +5,7 @@
 //! sortis. Le plateau étant toujours vu du joueur à jouer, on encode « moi »
 //! (pions positifs) puis « l'adversaire » (pions négatifs).
 
-use crate::board::Board;
+use engine::board::Board;
 
 /// Nombre d'entrées du réseau.
 ///
@@ -30,7 +30,7 @@ pub fn encode(board: &Board) -> [f64; N_INPUTS] {
     let mut i = 0;
 
     for p in 0..24 {
-        let v = board.points[p];
+        let v = board.points()[p];
         let me = if v > 0 { v as u8 } else { 0 };
         let opp = if v < 0 { (-v) as u8 } else { 0 };
 
@@ -41,13 +41,13 @@ pub fn encode(board: &Board) -> [f64; N_INPUTS] {
     }
 
     // Barre : normalisée par 2 (moi, puis l'adversaire).
-    x[i] = board.bar[0] as f64 / 2.0;
-    x[i + 1] = board.bar[1] as f64 / 2.0;
+    x[i] = board.bar()[0] as f64 / 2.0;
+    x[i + 1] = board.bar()[1] as f64 / 2.0;
     i += 2;
 
     // Pions sortis : normalisés par 15 (sur 15 pions au total).
-    x[i] = board.off[0] as f64 / 15.0;
-    x[i + 1] = board.off[1] as f64 / 15.0;
+    x[i] = board.off()[0] as f64 / 15.0;
+    x[i + 1] = board.off()[1] as f64 / 15.0;
     i += 2;
 
     debug_assert_eq!(i, N_INPUTS);
@@ -80,11 +80,7 @@ mod tests {
     fn barre_et_sorties() {
         let mut points = [0i8; 24];
         points[0] = 3; // 3 pions à moi sur la case 0
-        let b = Board {
-            points,
-            bar: [2, 1],
-            off: [4, 15],
-        };
+        let b = Board::from_parts(points, [2, 1], [4, 15]);
         let x = encode(&b);
 
         // Case 0 : +3 → [1,1,1,0].
@@ -101,11 +97,7 @@ mod tests {
     fn surplus_au_dela_de_trois() {
         let mut points = [0i8; 24];
         points[10] = 6; // 6 pions → surplus (6-3)/2 = 1.5
-        let b = Board {
-            points,
-            bar: [0, 0],
-            off: [0, 0],
-        };
+        let b = Board::from_parts(points, [0, 0], [0, 0]);
         let x = encode(&b);
         let base = 10 * 8;
         assert_eq!(x[base..base + 4], [1.0, 1.0, 1.0, 1.5]);

@@ -1,0 +1,22 @@
+# L'interface : la TUI Ratatui (`cargo run`) et l'outil d'entraînement
+# (`cargo run --release --bin train`).
+
+[package]
+name = "backgammon-cli"
+version.workspace = true
+edition.workspace = true
+# `cargo run` sans `--bin` lance la TUI.
+default-run = "backgammon"
+
+[[bin]]
+name = "backgammon"
+path = "src/main.rs"
+
+[[bin]]
+name = "train"
+path = "src/bin/train.rs"
+
+[dependencies]
+backgammon-engine.workspace = true
+backgammon-ai.workspace = true
+ratatui.workspace = true

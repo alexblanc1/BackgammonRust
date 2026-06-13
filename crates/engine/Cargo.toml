@@ -1,0 +1,15 @@
+# Le moteur de jeu : plateau, dés, coups légaux, partie, videau, et les agents
+# de base (aléatoire, humain console). Aucune dépendance d'affichage ni d'IA.
+
+[package]
+name = "backgammon-engine"
+version.workspace = true
+edition.workspace = true
+
+# Le nom d'import dans le code : `engine::Board` plutôt que
+# `backgammon_engine::Board`.
+[lib]
+name = "engine"
+
+[dependencies]
+rand.workspace = true
